@@ -81,7 +81,7 @@ BEGIN
 
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql security definer set search_path to pg_catalog, public, pg_temp;
 """
         assert CREATE_TRIGGER_TEMPLATE == expected
 
