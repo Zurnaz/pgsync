@@ -8,8 +8,11 @@ from time import time
 from typing import Callable, Optional
 from urllib.parse import ParseResult, urlparse
 
+import sqlalchemy as sa
+import sqlparse
+
 from .exc import SchemaError
-from .settings import CHECKPOINT_PATH, SCHEMA
+from .settings import CHECKPOINT_PATH, QUERY_LITERAL_BINDS, SCHEMA
 from .urls import get_elasticsearch_url, get_postgres_url, get_redis_url
 
 logger = logging.getLogger(__name__)
@@ -21,10 +24,10 @@ HIGHLIGHT_END = "\033[0m:"
 def timeit(func: Callable):
     def timed(*args, **kwargs):
         since: float = time()
-        retval = func(*args, **kwargs)
+        fn = func(*args, **kwargs)
         until: float = time()
         sys.stdout.write(f"{func.__name__}: {until-since} secs\n")
-        return retval
+        return fn
 
     return timed
 
@@ -65,13 +68,14 @@ def exception(func: Callable):
         try:
             fn = func(*args, **kwargs)
         except Exception as e:
-            name: str = threading.currentThread().getName()
+            name: str = threading.current_thread().name
             sys.stdout.write(
                 f"Exception in {func.__name__}() for thread {name}: {e}\n"
                 f"Exiting...\n"
             )
             os._exit(-1)
-        return fn
+        else:
+            return fn
 
     return wrapper
 
@@ -117,5 +121,28 @@ def get_config(config: Optional[str] = None) -> str:
             "provide args --config /path/to/schema.json"
         )
     if not os.path.exists(config):
-        raise IOError(f'Schema config "{config}" not found')
+        raise FileNotFoundError(f'Schema config "{config}" not found')
     return config
+
+
+def compiled_query(
+    query: str,
+    label: Optional[str] = None,
+    literal_binds: bool = QUERY_LITERAL_BINDS,
+) -> None:
+    """Compile an SQLAlchemy query with an optional label."""
+    query: str = str(
+        query.compile(
+            dialect=sa.dialects.postgresql.dialect(),
+            compile_kwargs={"literal_binds": literal_binds},
+        )
+    )
+    query: str = sqlparse.format(query, reindent=True, keyword_case="upper")
+    if label:
+        logger.debug(f"\033[4m{label}:\033[0m\n{query}")
+        sys.stdout.write(f"\033[4m{label}:\033[0m\n{query}\n")
+    else:
+        logger.debug(f"{query}")
+        sys.stdout.write(f"{query}\n")
+    sys.stdout.write("-" * 79)
+    sys.stdout.write("\n")

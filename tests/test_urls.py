@@ -42,6 +42,14 @@ class TestUrls(object):
         )
         url = get_postgres_url("mydb", port=9999)
         assert url.endswith("@localhost:9999/mydb")
+        # with patch("pgsync.urls.logger") as mock_logger:
+        #     assert (
+        #         get_postgres_url("mydb", user="kermit")
+        #         == "postgresql+psycopg2://kermit@localhost:5432/mydb"
+        #     )
+        #     mock_logger.debug.assert_called_once_with(
+        #         "Connecting to Postgres without password."
+        #     )
 
     @patch("pgsync.urls.logger")
     def test_get_redis_url(self, mock_logger):
@@ -78,4 +86,4 @@ class TestUrls(object):
             mock_logger.assert_not_called()
 
         with patch("pgsync.urls.Plugins", side_effect=ModuleNotFoundError):
-            _get_auth("something")
+            assert _get_auth("something") is None

@@ -15,7 +15,7 @@ class Plugin(ABC):
 
     @abstractmethod
     def transform(self, doc: dict, **kwargs) -> dict:
-        """Must be implemented by all derived classes."""
+        """This must be implemented by all derived classes."""
         pass
 
 
@@ -26,7 +26,7 @@ class Plugins(object):
         self.reload()
 
     def reload(self) -> None:
-        """Reload the plugins from the available list."""
+        """Reloads the plugins from the available list."""
         self.plugins: list = []
         self._paths: list = []
         logger.debug(f"Reloading plugins from package: {self.package}")
@@ -34,17 +34,15 @@ class Plugins(object):
 
     def walk(self, package: str) -> None:
         """Recursively walk the supplied package and fetch all plugins."""
-        plugins = import_module(package)
+        module = import_module(package)
         for _, name, ispkg in iter_modules(
-            plugins.__path__,
-            f"{plugins.__name__}.",
+            module.__path__,
+            prefix=f"{module.__name__}.",
         ):
             if ispkg:
                 continue
 
-            module = import_module(name)
-            members = getmembers(module, isclass)
-            for _, klass in members:
+            for _, klass in getmembers(import_module(name), isclass):
                 if issubclass(klass, Plugin) & (klass is not Plugin):
                     if klass.name not in self.names:
                         continue
@@ -54,10 +52,10 @@ class Plugins(object):
                     self.plugins.append(klass())
 
         paths: list = []
-        if isinstance(plugins.__path__, str):
-            paths.append(plugins.__path__)
+        if isinstance(module.__path__, str):
+            paths.append(module.__path__)
         else:
-            paths.extend([path for path in plugins.__path__])
+            paths.extend([path for path in module.__path__])
 
         for pkg_path in paths:
 
@@ -73,7 +71,7 @@ class Plugins(object):
                 self.walk(f"{package}.{pkg}")
 
     def transform(self, docs: list) -> dict:
-        """Apply all plugins to each doc."""
+        """Applies all plugins to each doc."""
         for doc in docs:
             for plugin in self.plugins:
                 doc["_source"] = plugin.transform(

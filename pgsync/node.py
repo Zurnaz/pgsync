@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import sqlalchemy as sa
 
@@ -18,7 +18,6 @@ from .constants import (
 )
 from .exc import (
     ColumnNotFoundError,
-    InvalidSchemaError,
     MultipleThroughTablesError,
     NodeAttributeError,
     RelationshipAttributeError,
@@ -39,12 +38,13 @@ class ForeignKey:
         self.foreign_key: str = self.foreign_key or dict()
         self.parent: str = self.foreign_key.get("parent")
         self.child: str = self.foreign_key.get("child")
-        if not set(self.foreign_key.keys()).issubset(
-            set(RELATIONSHIP_FOREIGN_KEYS)
-        ):
-            raise RelationshipForeignKeyError(
-                "ForeignKey Relationship must contain a parent and child."
-            )
+        if self.foreign_key:
+            if sorted(self.foreign_key.keys()) != sorted(
+                RELATIONSHIP_FOREIGN_KEYS
+            ):
+                raise RelationshipForeignKeyError(
+                    "ForeignKey Relationship must contain a parent and child."
+                )
         self.parent = self.foreign_key.get("parent")
         self.child = self.foreign_key.get("child")
 
@@ -64,6 +64,7 @@ class Relationship:
         self.through_tables: List[str] = self.relationship.get(
             "through_tables", []
         )
+        self.through_nodes: List[Node] = []
 
         if not set(self.relationship.keys()).issubset(
             set(RELATIONSHIP_ATTRIBUTES)
@@ -103,10 +104,9 @@ class Relationship:
 @dataclass
 class Node(object):
 
-    model: sa.sql.selectable.Alias
+    models: Callable
     table: str
     schema: str
-    materialized: bool = False
     primary_key: Optional[list] = None
     label: Optional[str] = None
     transform: Optional[dict] = None
@@ -116,6 +116,7 @@ class Node(object):
     base_tables: Optional[list] = None
 
     def __post_init__(self):
+        self.model: sa.sql.Alias = self.models(self.table, self.schema)
         self.columns = self.columns or []
         self.children: List[Node] = []
         self.table_columns: List[str] = self.model.columns.keys()
@@ -133,6 +134,30 @@ class Node(object):
 
         if self.label is None:
             self.label = self.table
+
+        self.prepare_columns()
+
+        self.relationship: Relationship = Relationship(self.relationship)
+        self._subquery = None
+        self._filters: list = []
+        self._mapping: dict = {}
+
+        for through_table in self.relationship.through_tables:
+            self.relationship.through_nodes.append(
+                Node(
+                    models=self.models,
+                    table=through_table,
+                    schema=self.schema,
+                    parent=self,
+                    primary_key=[],
+                )
+            )
+
+    def __str__(self):
+        return f"Node: {self.schema}.{self.label}"
+
+    def prepare_columns(self):
+
         self.columns = []
 
         for column_name in self.column_names:
@@ -174,14 +199,6 @@ class Node(object):
                 self.columns.append(column_name)
                 self.columns.append(self.model.c[column_name])
 
-        self.relationship: Relationship = Relationship(self.relationship)
-        self._subquery = None
-        self._filters: list = []
-        self._mapping: dict = {}
-
-    def __str__(self):
-        return f"node: {self.schema}.{self.table}"
-
     @property
     def primary_keys(self):
         return [
@@ -207,11 +224,15 @@ class Node(object):
             raise RelationshipError(
                 f'Relationship not present on "{node.name}"'
             )
-        self.children.append(node)
+        if node not in self.children:
+            self.children.append(node)
 
     def display(self, prefix: str = "", leaf: bool = True) -> None:
         print(
-            prefix, " - " if leaf else "|- ", self.table, sep=""
+            prefix,
+            " - " if leaf else "|- ",
+            f"{self.schema}.{self.label}",
+            sep="",
         )  # noqa T001
         prefix += "   " if leaf else "|  "
         for i, child in enumerate(self.children):
@@ -234,83 +255,64 @@ class Node(object):
 
 @dataclass
 class Tree:
-    base: "base.Base"
+
+    models: Callable
 
     def __post_init__(self):
-        self.nodes: Set[str] = set()
-        self.through_nodes: Set[str] = set()
+        self.tables: Set[str] = set()
+        self.__nodes: Dict[Node] = {}
 
-    def build(self, root: dict) -> Node:
+    def build(self, data: dict) -> Node:
 
-        table: str = root.get("table")
-        schema: str = root.get("schema", DEFAULT_SCHEMA)
+        table: str = data.get("table")
+        schema: str = data.get("schema", DEFAULT_SCHEMA)
+        key: Tuple[str, str] = (schema, table)
 
         if table is None:
-            raise TableNotInNodeError(f"Table not specified in node: {root}")
+            raise TableNotInNodeError(f"Table not specified in node: {data}")
 
-        if schema and schema not in self.base.schemas:
-            raise InvalidSchemaError(f"Unknown schema name(s): {schema}")
-
-        if not set(root.keys()).issubset(set(NODE_ATTRIBUTES)):
-            attrs = set(root.keys()).difference(set(NODE_ATTRIBUTES))
+        if not set(data.keys()).issubset(set(NODE_ATTRIBUTES)):
+            attrs = set(data.keys()).difference(set(NODE_ATTRIBUTES))
             raise NodeAttributeError(f"Unknown node attribute(s): {attrs}")
 
         node = Node(
-            model=self.base.model(table, schema=schema),
+            models=self.models,
             table=table,
             schema=schema,
-            primary_key=root.get("primary_key", []),
-            label=root.get("label", table),
-            transform=root.get("transform", {}),
-            columns=root.get("columns", []),
-            relationship=root.get("relationship", {}),
-            base_tables=root.get("base_tables", []),
-            materialized=(table in self.base._materialized_views(schema)),
+            primary_key=data.get("primary_key", []),
+            label=data.get("label", table),
+            transform=data.get("transform", {}),
+            columns=data.get("columns", []),
+            relationship=data.get("relationship", {}),
+            base_tables=data.get("base_tables", []),
         )
 
-        self.nodes.add(node.table)
+        self.tables.add(node.table)
+        for through_node in node.relationship.through_nodes:
+            self.tables.add(through_node.table)
 
-        for through_table in node.relationship.through_tables:
-            self.through_nodes.add(through_table)
-
-        for child in root.get("children", []):
-            if "table" not in child:
-                raise TableNotInNodeError(
-                    f"Table not specified in node: {child}"
-                )
-            if not set(child.keys()).issubset(set(NODE_ATTRIBUTES)):
-                attrs = set(child.keys()).difference(set(NODE_ATTRIBUTES))
-                raise NodeAttributeError(f"Unknown node attribute(s): {attrs}")
+        for child in data.get("children", []):
             node.add_child(self.build(child))
 
+        self.__nodes[key] = node
         return node
 
-
-# TODO: deprecate this method and use get_node
-def node_from_table(base, table: str, schema: str) -> Node:
-    return Node(
-        model=base.model(table, schema=schema),
-        table=table,
-        schema=schema,
-        label=table,
-        primary_key=[],
-    )
-
-
-def get_node(tree, table: str, node_dict: dict) -> Node:
-
-    root: Node = tree.build(node_dict)
-    for node in root.traverse_post_order():
-        if table == node.table:
-            return node
-        elif table in node.relationship.through_tables:
-            return Node(
-                model=tree.base.model(table, schema=node.schema),
-                table=table,
-                label=table,
-                schema=node.schema,
-                primary_key=[],
-                parent=node,
-            )
-    else:
-        raise RuntimeError(f"Node for {table} not found")
+    def get_node(self, root: Node, table: str, schema: str) -> Node:
+        """Get node by name."""
+        key: Tuple[str, str] = (schema, table)
+        if key not in self.__nodes:
+            for node in root.traverse_post_order():
+                if table == node.table and schema == node.schema:
+                    self.__nodes[key] = node
+                    return self.__nodes[key]
+                else:
+                    for through_node in node.relationship.through_nodes:
+                        if (
+                            table == through_node.table
+                            and schema == through_node.schema
+                        ):
+                            self.__nodes[key] = through_node
+                            return self.__nodes[key]
+            else:
+                raise RuntimeError(f"Node for {schema}.{table} not found")
+        return self.__nodes[key]

@@ -1,12 +1,10 @@
 """PGSync Base class."""
 import logging
 import os
-import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import sqlalchemy as sa
-import sqlparse
 from sqlalchemy.dialects import postgresql  # noqa
 from sqlalchemy.orm import sessionmaker
 
@@ -32,10 +30,11 @@ from .settings import (
     PG_SSLMODE,
     PG_SSLROOTCERT,
     QUERY_CHUNK_SIZE,
-    QUERY_LITERAL_BINDS,
+    STREAM_RESULTS,
 )
 from .trigger import CREATE_TRIGGER_TEMPLATE
 from .urls import get_postgres_url
+from .utils import compiled_query
 from .view import create_view, DropView, is_view, RefreshView
 
 try:
@@ -74,21 +73,24 @@ class TupleIdentifierType(sa.types.UserDefinedType):
 class Base(object):
     def __init__(self, database: str, verbose: bool = False, *args, **kwargs):
         """Initialize the base class constructor."""
-        self.__engine = pg_engine(database, **kwargs)
+        self.__engine: sa.engine.Engine = _pg_engine(
+            database, echo=False, **kwargs
+        )
         self.__schemas: Optional[dict] = None
         # models is a dict of f'{schema}.{table}'
-        self.models: Dict[str] = {}
-        self.__metadata: dict = {}
-        self.__indices: dict = {}
-        self.__views: dict = {}
-        self.__materialized_views: dict = {}
+        self.__models: Dict[str] = {}
+        self.__metadata: Dict[str] = {}
+        self.__indices: Dict[str] = {}
+        self.__views: Dict[str] = {}
+        self.__materialized_views: Dict[str] = {}
+        self.__tables: Dict[str] = {}
         self.verbose: bool = verbose
         self._conn = None
 
     def connect(self) -> None:
         """Connect to database."""
         try:
-            conn = self.__engine.connect()
+            conn = self.engine.connect()
             conn.close()
         except Exception as e:
             logger.exception(f"Cannot connect to database: {e}")
@@ -114,14 +116,15 @@ class Base(object):
                 f"Invalid user permission {permissions}"
             )
 
-        # Azure usernames are of the form username@host on the SQLAlchemy
-        # engine - engine.url.username@host but stored in
-        # pg_user as just user.
-        # we need to extract the real username from: username@host.
+        # Microsoft Azure usernames are of the form username@host on
+        # the SQLAlchemy engine.
+        # e.g engine.url.username@host
+        # but stored in pg_user as just user.
+        # we need to extract the real username from: username@host
         host_part: str = self.engine.url.host.split(".")[0]
         username: str = username.split(f"@{host_part}")[0]
 
-        with self.__engine.connect() as conn:
+        with self.engine.connect() as conn:
             return (
                 conn.execute(
                     sa.select([sa.column("usename")])
@@ -149,7 +152,7 @@ class Base(object):
             )
 
     # Tables...
-    def model(self, table: str, schema: str) -> dict:
+    def models(self, table: str, schema: str) -> sa.sql.Alias:
         """Get an SQLAlchemy model representation from a table.
 
         Args:
@@ -161,10 +164,10 @@ class Base(object):
 
         """
         name: str = f"{schema}.{table}"
-        if name not in self.models:
+        if name not in self.__models:
             if schema not in self.__metadata:
                 metadata = sa.MetaData(schema=schema)
-                metadata.reflect(self.__engine, views=True)
+                metadata.reflect(self.engine, views=True)
                 self.__metadata[schema] = metadata
             metadata = self.__metadata[schema]
             if name not in metadata.tables:
@@ -186,9 +189,9 @@ class Base(object):
                 "primary_keys",
                 sorted([primary_key.key for primary_key in model.primary_key]),
             )
-            self.models[f"{model.original}"] = model
+            self.__models[f"{model.original}"] = model
 
-        return self.models[name]
+        return self.__models[name]
 
     @property
     def conn(self):
@@ -197,15 +200,15 @@ class Base(object):
     @property
     def database(self) -> str:
         """str: Get the database name."""
-        return self.__engine.url.database
+        return self.engine.url.database
 
     @property
     def session(self) -> sessionmaker:
-        Session = sessionmaker(bind=self.__engine.connect(), autoflush=True)
+        Session = sessionmaker(bind=self.engine.connect(), autoflush=True)
         return Session()
 
     @property
-    def engine(self):
+    def engine(self) -> sa.engine.Engine:
         """Get the database engine."""
         return self.__engine
 
@@ -241,31 +244,21 @@ class Base(object):
                     self.__materialized_views[schema].append(table)
         return self.__materialized_views[schema]
 
-    def indices(self, table: str) -> list:
+    def indices(self, table: str, schema: str) -> list:
         """Get the database table indexes."""
         if table not in self.__indices:
-            self.__indices[table] = sa.inspect(self.engine).get_indexes(table)
+            self.__indices[table] = sorted(
+                sa.inspect(self.engine).get_indexes(table, schema=schema)
+            )
         return self.__indices[table]
 
-    def tables(self, schema: str) -> List:
-        """:obj:`list` of :obj:`str`: Get all tables.
-
-        returns the fully qualified table name with schema {schema}.{table}
-        """
-        if schema not in self.__metadata:
-            metadata = sa.MetaData(schema=schema)
-            metadata.reflect(self.__engine)
-            self.__metadata[schema] = metadata
-        metadata = self.__metadata[schema]
-        return metadata.tables.keys()
-
-    def _get_schema(self, schema: str, table: str) -> Tuple[str, str]:
-        pairs: list = table.split(".")
-        if len(pairs) == 2:
-            return pairs[0], pairs[1]
-        if len(pairs) == 1:
-            return schema, pairs[0]
-        raise ValueError(f"Invalid definition {table} for schema: {schema}")
+    def tables(self, schema: str) -> list:
+        """Get the table names for current schema."""
+        if schema not in self.__tables:
+            self.__tables[schema] = sorted(
+                sa.inspect(self.engine).get_table_names(schema)
+            )
+        return self.__tables[schema]
 
     def truncate_table(self, table: str, schema: str = DEFAULT_SCHEMA) -> None:
         """Truncate a table.
@@ -279,12 +272,8 @@ class Base(object):
             schema (str): The database schema
 
         """
-        if not table.startswith(f"{schema}."):
-            table = f"{schema}.{table}"
-        schema, table = self._get_schema(schema, table)
         logger.debug(f"Truncating table: {schema}.{table}")
-        query = f'TRUNCATE TABLE "{schema}"."{table}" CASCADE'
-        self.execute(query)
+        self.execute(sa.DDL(f'TRUNCATE TABLE "{schema}"."{table}" CASCADE'))
 
     def truncate_tables(
         self, tables: List[str], schema: str = DEFAULT_SCHEMA
@@ -375,9 +364,9 @@ class Base(object):
         upto_nchanges: Optional[int] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-    ) -> sa.sql.selectable.Select:
+    ) -> sa.sql.Select:
         filters: list = []
-        statement: sa.sql.selectable.Select = sa.select(
+        statement: sa.sql.Select = sa.select(
             [sa.column("xid"), sa.column("data")]
         ).select_from(
             func(
@@ -419,7 +408,7 @@ class Base(object):
         upto_nchanges: Optional[int] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-    ) -> List[sa.engine.row.LegacyRow]:
+    ) -> None:
         """Get/Consume changes from a logical replication slot.
 
         To get one change and data in existing replication slot:
@@ -428,7 +417,7 @@ class Base(object):
         To get ALL changes and data in existing replication slot:
         SELECT * FROM PG_LOGICAL_SLOT_GET_CHANGES('testdb', NULL, NULL)
         """
-        statement: sa.sql.selectable.Select = self._logical_slot_changes(
+        statement: sa.sql.Select = self._logical_slot_changes(
             slot_name,
             sa.func.PG_LOGICAL_SLOT_GET_CHANGES,
             txmin=txmin,
@@ -438,7 +427,7 @@ class Base(object):
             limit=limit,
             offset=offset,
         )
-        return self.fetchall(statement)
+        self.execute(statement)
 
     def logical_slot_peek_changes(
         self,
@@ -454,7 +443,7 @@ class Base(object):
 
         SELECT * FROM PG_LOGICAL_SLOT_PEEK_CHANGES('testdb', NULL, 1)
         """
-        statement: sa.sql.selectable.Select = self._logical_slot_changes(
+        statement: sa.sql.Select = self._logical_slot_changes(
             slot_name,
             sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
             txmin=txmin,
@@ -474,7 +463,7 @@ class Base(object):
         upto_lsn: Optional[int] = None,
         upto_nchanges: Optional[int] = None,
     ) -> int:
-        statement: sa.sql.selectable.Select = self._logical_slot_changes(
+        statement: sa.sql.Select = self._logical_slot_changes(
             slot_name,
             sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
             txmin=txmin,
@@ -482,7 +471,7 @@ class Base(object):
             upto_lsn=upto_lsn,
             upto_nchanges=upto_nchanges,
         )
-        with self.__engine.connect() as conn:
+        with self.engine.connect() as conn:
             return conn.execute(
                 statement.with_only_columns([sa.func.COUNT()])
             ).scalar()
@@ -493,7 +482,7 @@ class Base(object):
     ) -> None:
         create_view(
             self.engine,
-            self.model,
+            self.models,
             self.fetchall,
             schema,
             tables,
@@ -525,14 +514,8 @@ class Base(object):
         join_queries: bool = False,
     ) -> None:
         """Create a database triggers."""
-        self.execute(
-            CREATE_TRIGGER_TEMPLATE.replace(
-                MATERIALIZED_VIEW, f"{schema}.{MATERIALIZED_VIEW}"
-            )
-        )
         queries: List[str] = []
         for table in self.tables(schema):
-            schema, table = self._get_schema(schema, table)
             if (tables and table not in tables) or (
                 table in self.views(schema)
             ):
@@ -547,10 +530,11 @@ class Base(object):
                     f'CREATE TRIGGER "{table}_{name}" '
                     f'AFTER {" OR ".join(tg_op)} ON "{schema}"."{table}" '
                     f"FOR EACH {level} EXECUTE PROCEDURE "
-                    f"{TRIGGER_FUNC}()",
+                    f"{schema}.{TRIGGER_FUNC}()",
                 )
         if join_queries:
-            self.execute("; ".join(queries))
+            if queries:
+                self.execute(sa.DDL("; ".join(queries)))
         else:
             for query in queries:
                 self.execute(sa.DDL(query))
@@ -564,7 +548,6 @@ class Base(object):
         """Drop all pgsync defined triggers in database."""
         queries: List[str] = []
         for table in self.tables(schema):
-            schema, table = self._get_schema(schema, table)
             if tables and table not in tables:
                 continue
             logger.debug(f"Dropping trigger on table: {schema}.{table}")
@@ -574,34 +557,53 @@ class Base(object):
                     f'"{schema}"."{table}"'
                 )
         if join_queries:
-            self.execute("; ".join(queries))
+            if queries:
+                self.execute(sa.DDL("; ".join(queries)))
         else:
             for query in queries:
                 self.execute(sa.DDL(query))
 
+    def create_function(self, schema: str) -> None:
+        self.execute(
+            CREATE_TRIGGER_TEMPLATE.replace(
+                MATERIALIZED_VIEW,
+                f"{schema}.{MATERIALIZED_VIEW}",
+            ).replace(
+                TRIGGER_FUNC,
+                f"{schema}.{TRIGGER_FUNC}",
+            )
+        )
+
+    def drop_function(self, schema: str) -> None:
+        self.execute(
+            sa.DDL(
+                f'DROP FUNCTION IF EXISTS "{schema}".{TRIGGER_FUNC}() CASCADE'
+            )
+        )
+
     def disable_triggers(self, schema: str) -> None:
         """Disable all pgsync defined triggers in database."""
         for table in self.tables(schema):
-            schema, table = self._get_schema(schema, table)
             logger.debug(f"Disabling trigger on table: {schema}.{table}")
             for name in ("notify", "truncate"):
-                query = (
-                    f'ALTER TABLE "{schema}"."{table}" '
-                    f"DISABLE TRIGGER {table}_{name}"
+                self.execute(
+                    sa.DDL(
+                        f'ALTER TABLE "{schema}"."{table}" '
+                        f"DISABLE TRIGGER {table}_{name}"
+                    )
                 )
-                self.execute(query)
 
     def enable_triggers(self, schema: str) -> None:
         """Enable all pgsync defined triggers in database."""
         for table in self.tables(schema):
-            schema, table = self._get_schema(schema, table)
             logger.debug(f"Enabling trigger on table: {schema}.{table}")
             for name in ("notify", "truncate"):
-                query = (
-                    f'ALTER TABLE "{schema}"."{table}" '
-                    f"ENABLE TRIGGER {table}_{name}"
+                self.execute(
+                    sa.DDL(
+                        f'ALTER TABLE "{schema}"."{table}" '
+                        f"ENABLE TRIGGER {table}_{name}"
+                    )
                 )
-                self.execute(query)
 
     @property
     def txid_current(self) -> int:
@@ -653,10 +655,7 @@ class Base(object):
         ):
             value: str = value.lstrip("'").rstrip("'")
         if type_.lower() == "boolean":
-            try:
-                value: bool = bool(value)
-            except ValueError:
-                raise
+            value: bool = bool(value)
         if type_.lower() in (
             "double precision",
             "float4",
@@ -669,8 +668,8 @@ class Base(object):
                 raise
         return value
 
-    def parse_logical_slot(self, row):
-        def _parse_logical_slot(data):
+    def parse_logical_slot(self, row: str) -> dict:
+        def _parse_logical_slot(data: str) -> Tuple[str, str]:
 
             while True:
 
@@ -678,11 +677,11 @@ class Base(object):
                 if not match:
                     break
 
-                key = match.groupdict().get("key")
+                key: str = match.groupdict().get("key")
                 if key:
                     key = key.replace('"', "")
-                value = match.groupdict().get("value")
-                type_ = match.groupdict().get("type")
+                value: str = match.groupdict().get("value")
+                type_: str = match.groupdict().get("type")
 
                 value = self.parse_value(type_, value)
 
@@ -700,7 +699,7 @@ class Base(object):
 
         payload.update(match.groupdict())
         span = match.span()
-        # trailing space is deliberate
+        # including trailing space below is deliberate
         suffix: str = f"{row[span[1]:]} "
         tg_op: str = payload["tg_op"]
 
@@ -710,23 +709,24 @@ class Base(object):
                 msg = f"Unknown {tg_op} operation for row: {row}"
                 raise LogicalSlotParseError(msg)
 
-            i = suffix.index("old-key:")
+            i: int = suffix.index("old-key:")
             if i > -1:
-                j = suffix.index("new-tuple:")
-                s = suffix[i + len("old-key:") : j]
+                j: int = suffix.index("new-tuple:")
+                s: str = suffix[i + len("old-key:") : j]
                 for key, value in _parse_logical_slot(s):
                     payload["old"][key] = value
 
             i = suffix.index("new-tuple:")
             if i > -1:
-                s = suffix[i + len("new-tuple:") :]
+                s: str = suffix[i + len("new-tuple:") :]
                 for key, value in _parse_logical_slot(s):
                     payload["new"][key] = value
         else:
             # this can be an INSERT, DELETE, UPDATE or TRUNCATE operation
             if tg_op not in TG_OP:
-                message = f"Unknown {tg_op} operation for row: {row}"
-                raise LogicalSlotParseError(message)
+                raise LogicalSlotParseError(
+                    f"Unknown {tg_op} operation for row: {row}"
+                )
 
             for key, value in _parse_logical_slot(suffix):
                 payload["new"][key] = value
@@ -734,24 +734,23 @@ class Base(object):
         return payload
 
     # Querying...
-    def execute(self, statement, values=None, options=None):
+    def execute(
+        self,
+        statement: sa.sql.Select,
+        values: Optional[dict] = None,
+        options: Optional[dict] = None,
+    ) -> None:
         """Execute a query statement."""
-        conn = self.__engine.connect()
-        try:
-            if options:
-                conn = conn.execution_options(**options)
-            conn.execute(statement, values)
-            conn.close()
-        except Exception as e:
-            logger.exception(f"Exception {e}")
-            raise
+        pg_execute(self.engine, statement, values=values, options=options)
 
-    def fetchone(self, statement, label=None, literal_binds=False):
+    def fetchone(
+        self, statement: sa.sql.Select, label=None, literal_binds=False
+    ) -> sa.engine.Row:
         """Fetch one row query."""
         if self.verbose:
             compiled_query(statement, label=label, literal_binds=literal_binds)
 
-        conn = self.__engine.connect()
+        conn = self.engine.connect()
         try:
             row = conn.execute(statement).fetchone()
             conn.close()
@@ -760,12 +759,17 @@ class Base(object):
             raise
         return row
 
-    def fetchall(self, statement, label=None, literal_binds=False):
+    def fetchall(
+        self,
+        statement: sa.sql.Select,
+        label: Optional[str] = None,
+        literal_binds: bool = False,
+    ) -> List[sa.engine.Row]:
         """Fetch all rows from a query statement."""
         if self.verbose:
             compiled_query(statement, label=label, literal_binds=literal_binds)
 
-        conn = self.__engine.connect()
+        conn = self.engine.connect()
         try:
             rows = conn.execute(statement).fetchall()
             conn.close()
@@ -776,20 +780,22 @@ class Base(object):
 
     def fetchmany(
         self,
-        statement: sa.sql.selectable.Select,
+        statement: sa.sql.Select,
         chunk_size: Optional[int] = None,
+        stream_results: Optional[bool] = None,
     ):
         chunk_size: int = chunk_size or QUERY_CHUNK_SIZE
-        with self.__engine.connect() as conn:
-            result = conn.execution_options(stream_results=True).execute(
-                statement.select()
-            )
+        stream_results: bool = stream_results or STREAM_RESULTS
+        with self.engine.connect() as conn:
+            result = conn.execution_options(
+                stream_results=stream_results
+            ).execute(statement.select())
             for partition in result.partitions(chunk_size):
                 for keys, row, *primary_keys in partition:
                     yield keys, row, primary_keys
 
-    def fetchcount(self, statement):
-        with self.__engine.connect() as conn:
+    def fetchcount(self, statement: sa.sql.Subquery) -> int:
+        with self.engine.connect() as conn:
             return conn.execute(
                 statement.original.with_only_columns(
                     [sa.func.COUNT()]
@@ -820,7 +826,7 @@ def subtransactions(session):
     return ControlledExecution(session)
 
 
-def _get_foreign_keys(model_a, model_b) -> dict:
+def _get_foreign_keys(model_a: sa.sql.Alias, model_b: sa.sql.Alias) -> dict:
 
     foreign_keys: dict = defaultdict(list)
 
@@ -890,16 +896,78 @@ def get_foreign_keys(node_a: Node, node_b: Node) -> dict:
 
 
 def pg_engine(
-    database,
-    user=None,
-    host=None,
-    password=None,
-    port=None,
-    echo=False,
-    sslmode=None,
-    sslrootcert=None,
+    database: str,
+    user: Optional[str] = None,
+    host: Optional[str] = None,
+    password: Optional[str] = None,
+    port: Optional[str] = None,
+    echo: bool = False,
+    sslmode: Optional[str] = None,
+    sslrootcert: Optional[str] = None,
 ):
-    connect_args = {}
+    """Context manager for managing engines."""
+
+    class ControlledExecution:
+        def __init__(
+            self,
+            database: str,
+            user: Optional[str] = None,
+            host: Optional[str] = None,
+            password: Optional[str] = None,
+            port: Optional[str] = None,
+            echo: bool = False,
+            sslmode: Optional[str] = None,
+            sslrootcert: Optional[str] = None,
+        ):
+            self.database = database
+            self.user = user
+            self.host = host
+            self.password = password
+            self.port = port
+            self.echo = echo
+            self.sslmode = sslmode
+            self.sslrootcert = sslrootcert
+
+        def __enter__(self) -> sa.engine.Engine:
+            self._engine = _pg_engine(
+                database,
+                user=self.user,
+                host=self.host,
+                password=self.password,
+                port=self.port,
+                echo=self.echo,
+                sslmode=self.sslmode,
+                sslrootcert=self.sslrootcert,
+            )
+            return self._engine
+
+        def __exit__(self, type, value, traceback) -> None:
+            self._engine.connect().close()
+            self._engine.dispose()
+
+    return ControlledExecution(
+        database,
+        user=user,
+        host=host,
+        password=host,
+        port=port,
+        echo=echo,
+        sslmode=sslmode,
+        sslrootcert=sslrootcert,
+    )
+
+
+def _pg_engine(
+    database: str,
+    user: Optional[str] = None,
+    host: Optional[str] = None,
+    password: Optional[str] = None,
+    port: Optional[str] = None,
+    echo: bool = False,
+    sslmode: Optional[str] = None,
+    sslrootcert: Optional[str] = None,
+) -> sa.engine.Engine:
+    connect_args: dict = {}
     sslmode: str = sslmode or PG_SSLMODE
     sslrootcert: str = sslrootcert or PG_SSLROOTCERT
 
@@ -935,8 +1003,8 @@ def pg_engine(
 
 
 def pg_execute(
-    engine,
-    query,
+    engine: sa.engine.Engine,
+    statement: sa.sql.Select,
     values: Optional[list] = None,
     options: Optional[dict] = None,
 ) -> None:
@@ -945,32 +1013,34 @@ def pg_execute(
     try:
         if options:
             conn = conn.execution_options(**options)
-        conn.execute(query, values)
+        conn.execute(statement, values)
         conn.close()
     except Exception as e:
         logger.exception(f"Exception {e}")
         raise
 
 
-def create_schema(engine, schema) -> None:
+def create_schema(database: str, schema: str, echo: bool = False) -> None:
     """Create database schema."""
-    if schema != DEFAULT_SCHEMA:
-        engine.execute(sa.schema.CreateSchema(schema))
+    logger.debug(f"Creating schema: {schema}")
+    with pg_engine(database, echo=echo) as engine:
+        pg_execute(engine, sa.DDL(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
+    logger.debug(f"Created schema: {schema}")
 
 
 def create_database(database: str, echo: bool = False) -> None:
     """Create a database."""
     logger.debug(f"Creating database: {database}")
-    engine = pg_engine(database="postgres", echo=echo)
-    pg_execute(engine, f'CREATE DATABASE "{database}"')
+    with pg_engine("postgres", echo=echo) as engine:
+        pg_execute(engine, sa.DDL(f'CREATE DATABASE "{database}"'))
     logger.debug(f"Created database: {database}")
 
 
 def drop_database(database: str, echo: bool = False) -> None:
     """Drop a database."""
     logger.debug(f"Dropping database: {database}")
-    engine = pg_engine(database="postgres", echo=echo)
-    pg_execute(engine, f'DROP DATABASE IF EXISTS "{database}"')
+    with pg_engine("postgres", echo=echo) as engine:
+        pg_execute(engine, sa.DDL(f'DROP DATABASE IF EXISTS "{database}"'))
     logger.debug(f"Dropped database: {database}")
 
 
@@ -979,40 +1049,17 @@ def create_extension(
 ) -> None:
     """Create a database extension."""
     logger.debug(f"Creating extension: {extension}")
-    engine = pg_engine(database=database, echo=echo)
-    pg_execute(engine, f'CREATE EXTENSION IF NOT EXISTS "{extension}"')
+    with pg_engine(database, echo=echo) as engine:
+        pg_execute(
+            engine,
+            sa.DDL(f'CREATE EXTENSION IF NOT EXISTS "{extension}"'),
+        )
     logger.debug(f"Created extension: {extension}")
 
 
 def drop_extension(database: str, extension: str, echo: bool = False) -> None:
     """Drop a database extension."""
     logger.debug(f"Dropping extension: {extension}")
-    engine = pg_engine(database=database, echo=echo)
-    pg_execute(engine, f'DROP EXTENSION IF EXISTS "{extension}"')
+    with pg_engine(database, echo=echo) as engine:
+        pg_execute(engine, sa.DDL(f'DROP EXTENSION IF EXISTS "{extension}"'))
     logger.debug(f"Dropped extension: {extension}")
-
-
-def compiled_query(
-    query: str, label: Optional[str] = None, literal_binds: bool = False
-) -> None:
-    """Compile an SQLAlchemy query with an optional label."""
-
-    # overide env value of literal_binds
-    if QUERY_LITERAL_BINDS:
-        literal_binds = QUERY_LITERAL_BINDS
-
-    query: str = str(
-        query.compile(
-            dialect=sa.dialects.postgresql.dialect(),
-            compile_kwargs={"literal_binds": literal_binds},
-        )
-    )
-    query: str = sqlparse.format(query, reindent=True, keyword_case="upper")
-    if label:
-        logger.debug(f"\033[4m{label}:\033[0m\n{query}")
-        sys.stdout.write(f"\033[4m{label}:\033[0m\n{query}\n")
-    else:
-        logging.debug(f"{query}")
-        sys.stdout.write(f"{query}\n")
-    sys.stdout.write("-" * 79)
-    sys.stdout.write("\n")

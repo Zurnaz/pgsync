@@ -262,6 +262,7 @@ def book_cls(base, publisher_cls, user_cls):
             backref=sa.orm.backref("sellers"),
             foreign_keys=[seller_id],
         )
+        tags = sa.Column(sa.dialects.postgresql.JSONB, nullable=True)
 
     return Book
 
@@ -410,7 +411,7 @@ def table_creator(base, connection, model_mapping):
     base.metadata.drop_all(connection)
     try:
         os.unlink(f".{connection.engine.url.database}_testdb")
-    except OSError:
+    except (OSError, FileNotFoundError):
         pass
 
 
@@ -509,6 +510,7 @@ def dataset(
         title="It",
         description="Stephens Kings It",
         publisher=publisher_cls(name="Oxford Press"),
+        tags=["a", "b", 1],
     )
     book_002 = book_cls(
         isbn="002",

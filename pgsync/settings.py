@@ -25,7 +25,7 @@ NTHREADS_POLLDB = env.int("NTHREADS_POLLDB", default=1)
 PG_DRIVER = env.str("PG_DRIVER", default="psycopg2")
 # poll db interval (consider reducing this duration to increase throughput)
 POLL_TIMEOUT = env.float("POLL_TIMEOUT", default=0.1)
-QUERY_LITERAL_BINDS = env.bool("QUERY_LITERAL_BINDS", default=None)
+QUERY_LITERAL_BINDS = env.bool("QUERY_LITERAL_BINDS", default=False)
 # db query chunk size (how many records to fetch at a time)
 QUERY_CHUNK_SIZE = env.int("QUERY_CHUNK_SIZE", default=10000)
 # replication slot cleanup interval (in secs)
@@ -36,6 +36,7 @@ REPLICATION_SLOT_CLEANUP_INTERVAL = env.float(
 # path to the application schema config
 SCHEMA = env.str("SCHEMA", default=None)
 USE_ASYNC = env.bool("USE_ASYNC", default=False)
+STREAM_RESULTS = env.bool("STREAM_RESULTS", default=True)
 
 # Elasticsearch:
 ELASTICSEARCH_API_KEY = env.str("ELASTICSEARCH_API_KEY", default=None)
@@ -135,6 +136,7 @@ REDIS_SCHEME = env.str("REDIS_SCHEME", default="redis")
 REDIS_SOCKET_TIMEOUT = env.int("REDIS_SOCKET_TIMEOUT", default=5)
 # number of items to write to Redis at a time
 REDIS_WRITE_CHUNK_SIZE = env.int("REDIS_WRITE_CHUNK_SIZE", default=1000)
+
 
 # Logging:
 def _get_logging_config(silent_loggers: Optional[str] = None):

@@ -4,7 +4,7 @@
 [![Build status](https://github.com/toluaina/pgsync/workflows/Build%20and%20Test/badge.svg)](https://github.com/toluaina/pgsync/actions)
 [![Python versions](https://img.shields.io/pypi/pyversions/pgsync)](https://pypi.org/project/pgsync)
 [![Downloads](https://img.shields.io/pypi/dm/pgsync)](https://pypi.org/project/pgsync)
-[![codecov](https://codecov.io/gh/toluaina/pgsync/branch/master/graph/badge.svg?token=cvQzYkz6CV)](https://codecov.io/gh/toluaina/pgsync)
+[![codecov](https://codecov.io/gh/toluaina/pgsync/branch/main/graph/badge.svg?token=cvQzYkz6CV)](https://codecov.io/gh/toluaina/pgsync)
 
 
 ## PostgreSQL to Elasticsearch sync
@@ -71,7 +71,7 @@ PGSync is written in Python (supporting version 3.7 onwards) and the stack is co
 PGSync leverages the [logical decoding](https://www.postgresql.org/docs/current/logicaldecoding.html) feature of [Postgres](https://www.postgresql.org) (introduced in PostgreSQL 9.4) to capture a continuous stream of change events.
 This feature needs to be enabled in your [Postgres](https://www.postgresql.org) configuration file by setting in the postgresql.conf file:
 ```
-> wal_level = logical
+wal_level = logical
 ```
 
 You can select any pivot table to be the root of your document.
@@ -124,7 +124,7 @@ $ curl -X GET http://[elasticsearch host]:9201/reservations/_search?pretty=true
 - Installation
   - Install PGSync from pypi using pip
     - ```$ pip install pgsync``` 
-  - Create a [schema.json](https://github.com/toluaina/pgsync/blob/master/examples/airbnb/schema.json) for you document representation
+  - Create a [schema.json](https://github.com/toluaina/pgsync/blob/main/examples/airbnb/schema.json) for you document representation
   - Bootstrap the database (one time only)
     - ```bootstrap --config schema.json```
   - Run the program with 

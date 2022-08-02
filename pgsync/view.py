@@ -95,10 +95,10 @@ def compile_refresh_view(
 
 
 class CreateIndex(DDLElement):
-    def __init__(self, name: str, schema: str, view: str, columns: list):
+    def __init__(self, name: str, schema: str, entity: str, columns: list):
         self.schema: str = schema
         self.name: str = name
-        self.view: str = view
+        self.entity: str = entity
         self.columns: list = columns
 
 
@@ -108,7 +108,7 @@ def compile_create_index(
 ) -> str:
     return (
         f"CREATE UNIQUE INDEX {element.name} ON "
-        f'"{element.schema}"."{element.view}" ({", ".join(element.columns)})'
+        f'"{element.schema}"."{element.entity}" ({", ".join(element.columns)})'
     )
 
 
@@ -125,19 +125,16 @@ def compile_drop_index(
 
 
 def _get_constraints(
-    model: Callable,
+    models: Callable,
     schema: str,
     tables: List[str],
     label: str,
     constraint_type: str,
-) -> sa.sql.selectable.Select:
+) -> sa.sql.Select:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=sa.exc.SAWarning)
-        table_constraints = model("table_constraints", "information_schema")
-        key_column_usage = model("key_column_usage", "information_schema")
-        constraint_column_usage = model(
-            "constraint_column_usage", "information_schema"
-        )
+        table_constraints = models("table_constraints", "information_schema")
+        key_column_usage = models("key_column_usage", "information_schema")
     return (
         sa.select(
             [
@@ -160,15 +157,6 @@ def _get_constraints(
                 key_column_usage.c.table_schema == schema,
             ),
         )
-        .join(
-            constraint_column_usage,
-            sa.and_(
-                constraint_column_usage.c.constraint_name
-                == table_constraints.c.constraint_name,
-                constraint_column_usage.c.table_schema
-                == table_constraints.c.table_schema,
-            ),
-        )
         .where(
             *[
                 table_constraints.c.table_name.in_(tables),
@@ -180,10 +168,10 @@ def _get_constraints(
 
 
 def _primary_keys(
-    model: Callable, schema: str, tables: List[str]
-) -> sa.sql.selectable.Select:
+    models: Callable, schema: str, tables: List[str]
+) -> sa.sql.Select:
     return _get_constraints(
-        model,
+        models,
         schema,
         tables,
         label="primary_keys",
@@ -192,10 +180,10 @@ def _primary_keys(
 
 
 def _foreign_keys(
-    model: Callable, schema: str, tables: List[str]
-) -> sa.sql.selectable.Select:
+    models: Callable, schema: str, tables: List[str]
+) -> sa.sql.Select:
     return _get_constraints(
-        model,
+        models,
         schema,
         tables,
         label="foreign_keys",
@@ -204,8 +192,8 @@ def _foreign_keys(
 
 
 def create_view(
-    engine,
-    model: Callable,
+    engine: sa.engine.Engine,
+    models: Callable,
     fetchall: Callable,
     schema: str,
     tables: list,
@@ -242,7 +230,7 @@ def create_view(
         ):
             rows.setdefault(
                 table_name,
-                {"primary_keys": set([]), "foreign_keys": set([])},
+                {"primary_keys": set(), "foreign_keys": set()},
             )
             if primary_keys:
                 rows[table_name]["primary_keys"] = set(primary_keys)
@@ -255,18 +243,18 @@ def create_view(
         for table in set(tables):
             tables.add(f"{schema}.{table}")
 
-    for table_name, columns in fetchall(_primary_keys(model, schema, tables)):
+    for table_name, columns in fetchall(_primary_keys(models, schema, tables)):
         rows.setdefault(
             table_name,
-            {"primary_keys": set([]), "foreign_keys": set([])},
+            {"primary_keys": set(), "foreign_keys": set()},
         )
         if columns:
             rows[table_name]["primary_keys"] |= set(columns)
 
-    for table_name, columns in fetchall(_foreign_keys(model, schema, tables)):
+    for table_name, columns in fetchall(_foreign_keys(models, schema, tables)):
         rows.setdefault(
             table_name,
-            {"primary_keys": set([]), "foreign_keys": set([])},
+            {"primary_keys": set(), "foreign_keys": set()},
         )
         if columns:
             rows[table_name]["foreign_keys"] |= set(columns)
@@ -275,7 +263,7 @@ def create_view(
         for table_name, columns in user_defined_fkey_tables.items():
             rows.setdefault(
                 table_name,
-                {"primary_keys": set([]), "foreign_keys": set([])},
+                {"primary_keys": set(), "foreign_keys": set()},
             )
             if columns:
                 rows[table_name]["foreign_keys"] |= set(columns)
@@ -283,7 +271,7 @@ def create_view(
     if not rows:
         rows.setdefault(
             None,
-            {"primary_keys": set([]), "foreign_keys": set([])},
+            {"primary_keys": set(), "foreign_keys": set()},
         )
 
     statement = sa.select(
@@ -318,7 +306,7 @@ def create_view(
 
 
 def is_view(
-    engine,
+    engine: sa.engine.Engine,
     schema: str,
     table: str,
     materialized: bool = True,
