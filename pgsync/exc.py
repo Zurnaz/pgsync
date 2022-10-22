@@ -1,4 +1,4 @@
-"""PGSync Error classes."""
+"""PGSync Error."""
 
 
 class RelationshipTypeError(Exception):
@@ -117,7 +117,7 @@ class MultipleThroughTablesError(Exception):
         return repr(self.value)
 
 
-class SuperUserError(Exception):
+class ReplicationSlotError(Exception):
     def __init__(self, value):
         self.value = value
 
@@ -150,14 +150,6 @@ class PrimaryKeyNotFoundError(Exception):
 
 
 class LogicalSlotParseError(Exception):
-    def __init__(self, value):
-        self.value = value
-
-    def __str__(self):
-        return repr(self.value)
-
-
-class InvalidPermissionError(Exception):
     def __init__(self, value):
         self.value = value
 

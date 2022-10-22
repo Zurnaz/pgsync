@@ -1,14 +1,13 @@
 """PGSync views."""
 import logging
 import warnings
-from typing import Callable, List
+from typing import Callable, List, Set
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.dialects.postgresql.base import PGDDLCompiler
 from sqlalchemy.ext import compiler
 from sqlalchemy.schema import DDLElement
-from sqlalchemy.sql import Values
 from sqlalchemy.sql.selectable import Select
 
 from .constants import DEFAULT_SCHEMA, MATERIALIZED_VIEW
@@ -127,7 +126,7 @@ def compile_drop_index(
 def _get_constraints(
     models: Callable,
     schema: str,
-    tables: List[str],
+    tables: Set[str],
     label: str,
     constraint_type: str,
 ) -> sa.sql.Select:
@@ -168,7 +167,7 @@ def _get_constraints(
 
 
 def _primary_keys(
-    models: Callable, schema: str, tables: List[str]
+    models: Callable, schema: str, tables: Set[str]
 ) -> sa.sql.Select:
     return _get_constraints(
         models,
@@ -180,7 +179,7 @@ def _primary_keys(
 
 
 def _foreign_keys(
-    models: Callable, schema: str, tables: List[str]
+    models: Callable, schema: str, tables: Set[str]
 ) -> sa.sql.Select:
     return _get_constraints(
         models,
@@ -196,7 +195,7 @@ def create_view(
     models: Callable,
     fetchall: Callable,
     schema: str,
-    tables: list,
+    tables: Set,
     user_defined_fkey_tables: dict,
     views: List[str],
 ) -> None:
@@ -275,7 +274,7 @@ def create_view(
         )
 
     statement = sa.select(
-        Values(
+        sa.sql.Values(
             sa.column("table_name"),
             sa.column("primary_keys"),
             sa.column("foreign_keys"),

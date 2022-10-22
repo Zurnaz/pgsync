@@ -6,7 +6,7 @@ from typing import List
 import pytest
 from mock import ANY, call, patch
 
-from pgsync.base import Base
+from pgsync.base import Base, Payload
 from pgsync.exc import PrimaryKeyNotFoundError, RDSError, SchemaError
 from pgsync.node import Node
 from pgsync.settings import LOGICAL_SLOT_CHUNK_SIZE, REDIS_POLL_INTERVAL
@@ -319,7 +319,9 @@ class TestSync(object):
             sync.pull()
             txmin = None
             txmax = sync.txid_current - 1
-            mock_get.assert_called_once_with(txmin=txmin, txmax=txmax)
+            mock_get.assert_called_once_with(
+                txmin=txmin, txmax=txmax, upto_nchanges=None
+            )
             mock_logger.debug.assert_called_once_with(
                 f"pull txmin: {txmin} - txmax: {txmax}"
             )
@@ -331,30 +333,30 @@ class TestSync(object):
     @patch("pgsync.sync.logger")
     def test__on_publish(self, mock_logger, mock_es, sync):
         payloads = [
-            {
-                "schema": "public",
-                "tg_op": "INSERT",
-                "table": "book",
-                "old": {"isbn": "001"},
-                "new": {"isbn": "0001"},
-                "xmin": 1234,
-            },
-            {
-                "schema": "public",
-                "tg_op": "INSERT",
-                "table": "book",
-                "old": {"isbn": "002"},
-                "new": {"isbn": "0002"},
-                "xmin": 1234,
-            },
-            {
-                "schema": "public",
-                "tg_op": "INSERT",
-                "table": "book",
-                "old": {"isbn": "003"},
-                "new": {"isbn": "0003"},
-                "xmin": 1234,
-            },
+            Payload(
+                schema="public",
+                tg_op="INSERT",
+                table="book",
+                old={"isbn": "001"},
+                new={"isbn": "0001"},
+                xmin=1234,
+            ),
+            Payload(
+                schema="public",
+                tg_op="INSERT",
+                table="book",
+                old={"isbn": "002"},
+                new={"isbn": "0002"},
+                xmin=1234,
+            ),
+            Payload(
+                schema="public",
+                tg_op="INSERT",
+                table="book",
+                old={"isbn": "003"},
+                new={"isbn": "0003"},
+                xmin=1234,
+            ),
         ]
         sync._on_publish(payloads)
         mock_logger.debug.assert_any_call("on_publish len 3")
@@ -365,30 +367,30 @@ class TestSync(object):
     @patch("pgsync.sync.logger")
     def test__on_publish_mixed_ops(self, mock_logger, mock_es, sync):
         payloads = [
-            {
-                "schema": "public",
-                "tg_op": "INSERT",
-                "table": "book",
-                "old": {"isbn": "001"},
-                "new": {"isbn": "0001"},
-                "xmin": 1234,
-            },
-            {
-                "schema": "public",
-                "tg_op": "UPDATE",
-                "table": "book",
-                "old": {"isbn": "002"},
-                "new": {"isbn": "0002"},
-                "xmin": 1234,
-            },
-            {
-                "schema": "public",
-                "tg_op": "DELETE",
-                "table": "book",
-                "old": {"isbn": "003"},
-                "new": {"isbn": "0003"},
-                "xmin": 1234,
-            },
+            Payload(
+                schema="public",
+                tg_op="INSERT",
+                table="book",
+                old={"isbn": "001"},
+                new={"isbn": "0001"},
+                xmin=1234,
+            ),
+            Payload(
+                schema="public",
+                tg_op="UPDATE",
+                table="book",
+                old={"isbn": "002"},
+                new={"isbn": "0002"},
+                xmin=1234,
+            ),
+            Payload(
+                schema="public",
+                tg_op="DELETE",
+                table="book",
+                old={"isbn": "003"},
+                new={"isbn": "0003"},
+                xmin=1234,
+            ),
         ]
         sync._on_publish(payloads)
         mock_logger.debug.assert_any_call("on_publish len 3")
@@ -399,14 +401,14 @@ class TestSync(object):
     @patch("pgsync.sync.Sync._on_publish")
     def test_on_publish(self, mock_on_publish, sync):
         payloads = [
-            {
-                "schema": "public",
-                "tg_op": "DELETE",
-                "table": "book",
-                "old": {"isbn": "003"},
-                "new": {"isbn": "0003"},
-                "xmin": 1234,
-            },
+            Payload(
+                schema="public",
+                tg_op="DELETE",
+                table="book",
+                old={"isbn": "003"},
+                new={"isbn": "0003"},
+                xmin=1234,
+            ),
         ]
         sync.on_publish(payloads)
         mock_on_publish.assert_called_once_with(payloads)
@@ -448,13 +450,13 @@ class TestSync(object):
             schema="public",
         )
         filters: dict = {"book": []}
-        payloads: List[dict] = [
-            {
-                "tg_op": "UPDATE",
-                "table": "book",
-                "old": {"isbn": "001"},
-                "new": {"isbn": "aa1"},
-            }
+        payloads: List[Payload] = [
+            Payload(
+                tg_op="UPDATE",
+                table="book",
+                old={"isbn": "001"},
+                new={"isbn": "aa1"},
+            )
         ]
         extra: dict = {}
         assert sync.es.doc_count == 0
@@ -473,12 +475,12 @@ class TestSync(object):
             schema="public",
         )
         filters: dict = {"book": []}
-        payloads: List[dict] = [
-            {
-                "tg_op": "INSERT",
-                "table": "book",
-                "new": {"isbn": "001"},
-            }
+        payloads: List[Payload] = [
+            Payload(
+                tg_op="INSERT",
+                table="book",
+                new={"isbn": "001"},
+            )
         ]
         _filters = sync._insert_op(node, filters, payloads)
         assert _filters == {"book": [{"isbn": "001"}]}
@@ -492,20 +494,20 @@ class TestSync(object):
             table="publisher",
             schema="public",
         )
-        payloads: List[dict] = [
-            {
-                "tg_op": "INSERT",
-                "table": "publisher",
-                "new": {"id": 1},
-            }
+        payloads: List[Payload] = [
+            Payload(
+                tg_op="INSERT",
+                table="publisher",
+                new={"id": 1},
+            )
         ]
         node.parent = None
         with pytest.raises(Exception):
             with patch("pgsync.sync.logger") as mock_logger:
                 _filters = sync._insert_op(node, {"publisher": []}, payloads)
-        mock_logger.exception.assert_called_once_with(
-            "Could not get parent from node: public.publisher"
-        )
+            mock_logger.exception.assert_called_once_with(
+                "Could not get parent from node: public.publisher"
+            )
 
     @patch("pgsync.elastichelper.ElasticHelper.bulk")
     def test__delete_op(self, mock_es, sync, connection):
@@ -516,12 +518,13 @@ class TestSync(object):
             schema="public",
         )
         filters: dict = {"book": []}
-        payloads: List[dict] = [
-            {
-                "tg_op": "DELETE",
-                "table": "book",
-                "new": {"isbn": "001"},
-            }
+        payloads: List[Payload] = [
+            Payload(
+                tg_op="DELETE",
+                table="book",
+                new={"isbn": "001"},
+                old=None,
+            )
         ]
         _filters = sync._delete_op(node, filters, payloads)
         assert _filters == {"book": []}
@@ -559,11 +562,11 @@ class TestSync(object):
             with pytest.raises(RuntimeError):
                 for _ in sync._payloads(
                     [
-                        {
-                            "tg_op": "XXX",
-                            "table": "book",
-                            "old": {"id": 1},
-                        },
+                        Payload(
+                            tg_op="XXX",
+                            table="book",
+                            old={"id": 1},
+                        ),
                     ]
                 ):
                     pass
@@ -573,13 +576,13 @@ class TestSync(object):
             with patch("pgsync.sync.logger") as mock_logger:
                 for _ in sync._payloads(
                     [
-                        {
-                            "tg_op": "INSERT",
-                            "table": "book",
-                            "schema": "public",
-                            "new": {"isbn": "001"},
-                            "old": {"isbn": "002"},
-                        },
+                        Payload(
+                            tg_op="INSERT",
+                            table="book",
+                            schema="public",
+                            new={"isbn": "001"},
+                            old={"isbn": "002"},
+                        ),
                     ]
                 ):
                     pass
@@ -593,13 +596,13 @@ class TestSync(object):
             with patch("pgsync.sync.logger") as mock_logger:
                 for _ in sync._payloads(
                     [
-                        {
-                            "tg_op": "UPDATE",
-                            "table": "book",
-                            "schema": "public",
-                            "new": {"isbn": "001"},
-                            "old": {"isbn": "002"},
-                        },
+                        Payload(
+                            tg_op="UPDATE",
+                            table="book",
+                            schema="public",
+                            new={"isbn": "001"},
+                            old={"isbn": "002"},
+                        ),
                     ]
                 ):
                     pass
@@ -613,13 +616,13 @@ class TestSync(object):
             with patch("pgsync.sync.logger") as mock_logger:
                 for _ in sync._payloads(
                     [
-                        {
-                            "tg_op": "DELETE",
-                            "table": "book",
-                            "schema": "public",
-                            "new": {"isbn": "001"},
-                            "old": {"isbn": "002"},
-                        },
+                        Payload(
+                            tg_op="DELETE",
+                            table="book",
+                            schema="public",
+                            new={"isbn": "001"},
+                            old={"isbn": "002"},
+                        ),
                     ]
                 ):
                     pass
@@ -633,13 +636,13 @@ class TestSync(object):
             with patch("pgsync.sync.logger") as mock_logger:
                 for _ in sync._payloads(
                     [
-                        {
-                            "tg_op": "TRUNCATE",
-                            "table": "book",
-                            "schema": "public",
-                            "new": {"isbn": "001"},
-                            "old": {"isbn": "002"},
-                        },
+                        Payload(
+                            tg_op="TRUNCATE",
+                            table="book",
+                            schema="public",
+                            new={"isbn": "001"},
+                            old={"isbn": "002"},
+                        ),
                     ]
                 ):
                     pass
@@ -663,9 +666,9 @@ class TestSync(object):
             ]
         }
         assert len(node._filters) == 0
-        sync._build_filters(filters, node)
-        assert len(node._filters) == 1
-        assert str(node._filters[0]) == (
+        filters = sync.query_builder._build_filters(filters, node)
+        assert len(filters) == 2
+        assert str(filters) == (
             "book_1.isbn = :isbn_1 AND book_1.title = :title_1 OR "
             "book_1.isbn = :isbn_2 AND book_1.title = :title_2"
         )
@@ -685,43 +688,43 @@ class TestSync(object):
             )
 
     def test__payload_data(self, sync):
-        payload_data = sync._payload_data(
-            {
-                "tg_op": "INSERT",
-                "table": "book",
-                "old": {"id": 1},
-                "new": {"id": 4},
-            }
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            old={"id": 1},
+            new={"id": 4},
         )
-        assert payload_data == {"id": 4}
+        assert payload.data == {"id": 4}
+        assert payload.table == "book"
+        assert payload.tg_op == "INSERT"
 
-        payload_data = sync._payload_data(
-            {
-                "tg_op": "DELETE",
-                "table": "book",
-                "old": {"id": 1},
-                "new": {"id": 4},
-            }
+        payload = Payload(
+            tg_op="DELETE",
+            table="book",
+            old={"id": 1},
+            new={"id": 4},
         )
-        assert payload_data == {"id": 1}
 
-        payload_data = sync._payload_data(
-            {
-                "tg_op": "UPDATE",
-                "table": "book",
-                "old": {"id": 1},
-            }
-        )
-        assert payload_data is None
+        assert payload.data == {"id": 1}
+        assert payload.table == "book"
+        assert payload.tg_op == "DELETE"
 
-        payload_data = sync._payload_data(
-            {
-                "tg_op": "INSERT",
-                "table": "book",
-                "new": {"id": 1},
-            }
+        payload = Payload(
+            tg_op="UPDATE",
+            table="book",
+            new=None,
+            old={"id": 1},
         )
-        assert payload_data == {"id": 1}
+
+        assert payload.data == {}
+
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            new={"id": 1},
+        )
+
+        assert payload.data == {"id": 1}
 
     def test_get_doc_id(self, sync):
         doc_id = sync.get_doc_id(["column_1", "column_2"], "book")
@@ -798,19 +801,19 @@ class TestSync(object):
                 )
 
     def test_root(self, sync):
-        root = sync.root
+        root = sync.tree.root
         assert root is not None
         assert str(root) == "Node: public.book"
 
     def test_payloads(self, sync):
-        payloads = [
-            {
-                "tg_op": "INSERT",
-                "table": "book",
-                "old": {"isbn": "001"},
-                "new": {"isbn": "002"},
-                "schema": "public",
-            },
+        payloads: List[Payload] = [
+            Payload(
+                tg_op="INSERT",
+                table="book",
+                old={"isbn": "001"},
+                new={"isbn": "002"},
+                schema="public",
+            ),
         ]
         sync._payloads(payloads)
 
@@ -831,7 +834,7 @@ class TestSync(object):
         items = [{"tg_op": "INSERT"}, {"tg_op": "UPDATE"}]
         sync.redis.bulk_push(items)
         sync._poll_redis()
-        mock_on_publish.assert_called_once_with(items)
+        mock_on_publish.assert_called_once_with([ANY, ANY])
         mock_refresh_views.assert_called_once()
         mock_logger.debug.assert_called_once_with(f"poll_redis: {items}")
         mock_time.sleep.assert_called_once_with(REDIS_POLL_INTERVAL)

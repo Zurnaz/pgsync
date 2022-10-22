@@ -2,7 +2,7 @@
 import pytest
 
 from pgsync.constants import CONCAT_TRANSFORM, RENAME_TRANSFORM
-from pgsync.transform import get_private_keys, Transform
+from pgsync.transform import Transform
 
 
 @pytest.mark.usefixtures("table_creator")
@@ -183,12 +183,15 @@ class TestTransform(object):
 
     def test_rename_fields(self):
         nodes = {
-            "id": "my_id",
-            "code": "my_code",
-            "level": "levelup",
-            "Child1": {"column_1": "column1"},
+            "transform": {
+                "rename": {
+                    "id": "my_id",
+                    "code": "my_code",
+                    "level": "levelup",
+                    "Child1": {"column_1": "column1"},
+                }
+            }
         }
-
         row = {
             "level": 1,
             "id": "007",
@@ -354,15 +357,19 @@ class TestTransform(object):
 
     def test_concat_fields(self):
         nodes = {
-            "Child1": {
-                "columns": ["column_1", "column_2"],
-                "delimiter": "_",
-                "destination": "column_3",
-            },
-            "Child2": {
-                "columns": ["column_1"],
-                "destination": "column_3",
-            },
+            "transform": {
+                "concat": {
+                    "Child1": {
+                        "columns": ["column_1", "column_2"],
+                        "delimiter": "_",
+                        "destination": "column_3",
+                    },
+                    "Child2": {
+                        "columns": ["column_1"],
+                        "destination": "column_3",
+                    },
+                }
+            }
         }
 
         row = {
@@ -399,7 +406,7 @@ class TestTransform(object):
         # - with list order maintained
         # - without destination specified
 
-    def test_get_private_keys(self):
+    def test_get_primary_keys(self):
         primary_keys = [
             {"publisher": {"id": [4]}},
             {"book_language": [{"id": [7]}, {"id": [15]}]},
@@ -428,7 +435,7 @@ class TestTransform(object):
             [{"subject": [{"id": [4]}], "book_subject": [{"id": [7]}]}],
             {"rating": {"id": [7]}},
         ]
-        assert get_private_keys(primary_keys) == {
+        assert Transform.get_primary_keys(primary_keys) == {
             "publisher": {"id": [4]},
             "book_language": {"id": [7, 15]},
             "author": {"id": [4, 5]},

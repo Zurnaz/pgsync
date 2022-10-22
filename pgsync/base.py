@@ -1,8 +1,7 @@
-"""PGSync Base class."""
+"""PGSync Base."""
 import logging
 import os
-from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql  # noqa
@@ -11,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from .constants import (
     BUILTIN_SCHEMAS,
     DEFAULT_SCHEMA,
+    DELETE,
     LOGICAL_SLOT_PREFIX,
     LOGICAL_SLOT_SUFFIX,
     MATERIALIZED_VIEW,
@@ -20,12 +20,10 @@ from .constants import (
     UPDATE,
 )
 from .exc import (
-    ForeignKeyError,
-    InvalidPermissionError,
     LogicalSlotParseError,
+    ReplicationSlotError,
     TableNotFoundError,
 )
-from .node import Node
 from .settings import (
     PG_SSLMODE,
     PG_SSLROOTCERT,
@@ -51,6 +49,34 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class Payload(object):
+
+    __slots__ = ("tg_op", "table", "schema", "old", "new", "xmin")
+
+    def __init__(
+        self,
+        tg_op: str = Optional[None],
+        table: str = Optional[None],
+        schema: str = Optional[None],
+        old: dict = Optional[None],
+        new: dict = Optional[None],
+        xmin: int = Optional[None],
+    ):
+        self.tg_op: str = tg_op
+        self.table: str = table
+        self.schema: str = schema
+        self.old: dict = old or {}
+        self.new: dict = new or {}
+        self.xmin: str = xmin
+
+    @property
+    def data(self) -> dict:
+        """Extract the payload data from the payload."""
+        if self.tg_op == DELETE and self.old:
+            return self.old
+        return self.new
+
+
 class TupleIdentifierType(sa.types.UserDefinedType):
     cache_ok: bool = True
 
@@ -71,19 +97,21 @@ class TupleIdentifierType(sa.types.UserDefinedType):
 
 
 class Base(object):
-    def __init__(self, database: str, verbose: bool = False, *args, **kwargs):
+    def __init__(
+        self, database: str, verbose: bool = False, *args, **kwargs
+    ) -> None:
         """Initialize the base class constructor."""
         self.__engine: sa.engine.Engine = _pg_engine(
             database, echo=False, **kwargs
         )
         self.__schemas: Optional[dict] = None
         # models is a dict of f'{schema}.{table}'
-        self.__models: Dict[str] = {}
-        self.__metadata: Dict[str] = {}
-        self.__indices: Dict[str] = {}
-        self.__views: Dict[str] = {}
-        self.__materialized_views: Dict[str] = {}
-        self.__tables: Dict[str] = {}
+        self.__models: dict = {}
+        self.__metadata: dict = {}
+        self.__indices: dict = {}
+        self.__views: dict = {}
+        self.__materialized_views: dict = {}
+        self.__tables: dict = {}
         self.verbose: bool = verbose
         self._conn = None
 
@@ -107,49 +135,23 @@ class Base(object):
         except (TypeError, IndexError):
             return None
 
-    def has_permissions(self, username: str, permissions: List[str]) -> bool:
-        """Check if the given user is a superuser or replication user."""
-        if not set(permissions).issubset(
-            set(("usecreatedb", "usesuper", "userepl"))
-        ):
-            raise InvalidPermissionError(
-                f"Invalid user permission {permissions}"
-            )
+    def _can_create_replication_slot(self, slot_name: str) -> None:
+        """Check if the given user can create and destroy replication slots."""
+        if self.replication_slots(slot_name):
+            logger.exception(f"Replication slot {slot_name} already exists")
+            self.drop_replication_slot(slot_name)
 
-        # Microsoft Azure usernames are of the form username@host on
-        # the SQLAlchemy engine.
-        # e.g engine.url.username@host
-        # but stored in pg_user as just user.
-        # we need to extract the real username from: username@host
-        host_part: str = self.engine.url.host.split(".")[0]
-        username: str = username.split(f"@{host_part}")[0]
-
-        with self.engine.connect() as conn:
-            return (
-                conn.execute(
-                    sa.select([sa.column("usename")])
-                    .select_from(sa.text("pg_user"))
-                    .where(
-                        sa.and_(
-                            *[
-                                sa.column("usename") == username,
-                                sa.or_(
-                                    *[
-                                        (
-                                            sa.column(permission)
-                                            == True  # noqa E712
-                                        )
-                                        for permission in permissions
-                                    ]
-                                ),
-                            ]
-                        )
-                    )
-                    .with_only_columns([sa.func.COUNT()])
-                    .order_by(None)
-                ).scalar()
-                > 0
+        try:
+            self.create_replication_slot(slot_name)
+        except Exception as e:
+            logger.exception(f"{e}")
+            raise ReplicationSlotError(
+                f'PG_USER "{self.engine.url.username}" needs to be '
+                f"superuser or have permission to read, create and destroy "
+                f"replication slots to perform this action."
             )
+        else:
+            self.drop_replication_slot(slot_name)
 
     # Tables...
     def models(self, table: str, schema: str) -> sa.sql.Alias:
@@ -213,7 +215,7 @@ class Base(object):
         return self.__engine
 
     @property
-    def schemas(self) -> list:
+    def schemas(self) -> dict:
         """Get the database schema names."""
         if self.__schemas is None:
             self.__schemas = sa.inspect(self.engine).get_schema_names()
@@ -246,11 +248,11 @@ class Base(object):
 
     def indices(self, table: str, schema: str) -> list:
         """Get the database table indexes."""
-        if table not in self.__indices:
-            self.__indices[table] = sorted(
+        if (table, schema) not in self.__indices:
+            self.__indices[(table, schema)] = sorted(
                 sa.inspect(self.engine).get_indexes(table, schema=schema)
             )
-        return self.__indices[table]
+        return self.__indices[(table, schema)]
 
     def tables(self, schema: str) -> list:
         """Get the table names for current schema."""
@@ -478,7 +480,7 @@ class Base(object):
 
     # Views...
     def create_view(
-        self, schema: str, tables: list, user_defined_fkey_tables: dict
+        self, schema: str, tables: Set, user_defined_fkey_tables: dict
     ) -> None:
         create_view(
             self.engine,
@@ -642,7 +644,7 @@ class Base(object):
             "smallserial",
         ):
             try:
-                value: int = int(value)
+                value = int(value)
             except ValueError:
                 raise
         if type_.lower() in (
@@ -653,9 +655,9 @@ class Base(object):
             "uuid",
             "varchar",
         ):
-            value: str = value.lstrip("'").rstrip("'")
+            value = value.lstrip("'").rstrip("'")
         if type_.lower() == "boolean":
-            value: bool = bool(value)
+            value = bool(value)
         if type_.lower() in (
             "double precision",
             "float4",
@@ -663,12 +665,12 @@ class Base(object):
             "real",
         ):
             try:
-                value: float = float(value)
+                value = float(value)
             except ValueError:
                 raise
         return value
 
-    def parse_logical_slot(self, row: str) -> dict:
+    def parse_logical_slot(self, row: str) -> Payload:
         def _parse_logical_slot(data: str) -> Tuple[str, str]:
 
             while True:
@@ -689,24 +691,22 @@ class Base(object):
                 data = f"{data[match.span()[1]:]} "
                 yield key, value
 
-        payload: dict = dict(
-            schema=None, tg_op=None, table=None, old={}, new={}
-        )
-
         match = LOGICAL_SLOT_PREFIX.search(row)
         if not match:
             raise LogicalSlotParseError(f"No match for row: {row}")
 
-        payload.update(match.groupdict())
+        data = {"old": None, "new": None}
+        data.update(**match.groupdict())
+        payload: Payload = Payload(**data)
+
         span = match.span()
         # including trailing space below is deliberate
         suffix: str = f"{row[span[1]:]} "
-        tg_op: str = payload["tg_op"]
 
         if "old-key" and "new-tuple" in suffix:
             # this can only be an UPDATE operation
-            if tg_op != UPDATE:
-                msg = f"Unknown {tg_op} operation for row: {row}"
+            if payload.tg_op != UPDATE:
+                msg = f"Unknown {payload.tg_op} operation for row: {row}"
                 raise LogicalSlotParseError(msg)
 
             i: int = suffix.index("old-key:")
@@ -714,22 +714,22 @@ class Base(object):
                 j: int = suffix.index("new-tuple:")
                 s: str = suffix[i + len("old-key:") : j]
                 for key, value in _parse_logical_slot(s):
-                    payload["old"][key] = value
+                    payload.old[key] = value
 
             i = suffix.index("new-tuple:")
             if i > -1:
-                s: str = suffix[i + len("new-tuple:") :]
+                s = suffix[i + len("new-tuple:") :]
                 for key, value in _parse_logical_slot(s):
-                    payload["new"][key] = value
+                    payload.new[key] = value
         else:
             # this can be an INSERT, DELETE, UPDATE or TRUNCATE operation
-            if tg_op not in TG_OP:
+            if payload.tg_op not in TG_OP:
                 raise LogicalSlotParseError(
-                    f"Unknown {tg_op} operation for row: {row}"
+                    f"Unknown {payload.tg_op} operation for row: {row}"
                 )
 
             for key, value in _parse_logical_slot(suffix):
-                payload["new"][key] = value
+                payload.new[key] = value
 
         return payload
 
@@ -737,14 +737,17 @@ class Base(object):
     def execute(
         self,
         statement: sa.sql.Select,
-        values: Optional[dict] = None,
+        values: Optional[list] = None,
         options: Optional[dict] = None,
     ) -> None:
         """Execute a query statement."""
         pg_execute(self.engine, statement, values=values, options=options)
 
     def fetchone(
-        self, statement: sa.sql.Select, label=None, literal_binds=False
+        self,
+        statement: sa.sql.Select,
+        label: Optional[str] = None,
+        literal_binds: bool = False,
     ) -> sa.engine.Row:
         """Fetch one row query."""
         if self.verbose:
@@ -784,8 +787,8 @@ class Base(object):
         chunk_size: Optional[int] = None,
         stream_results: Optional[bool] = None,
     ):
-        chunk_size: int = chunk_size or QUERY_CHUNK_SIZE
-        stream_results: bool = stream_results or STREAM_RESULTS
+        chunk_size = chunk_size or QUERY_CHUNK_SIZE
+        stream_results = stream_results or STREAM_RESULTS
         with self.engine.connect() as conn:
             result = conn.execution_options(
                 stream_results=stream_results
@@ -793,6 +796,8 @@ class Base(object):
             for partition in result.partitions(chunk_size):
                 for keys, row, *primary_keys in partition:
                     yield keys, row, primary_keys
+            result.close()
+        self.engine.clear_compiled_cache()
 
     def fetchcount(self, statement: sa.sql.Subquery) -> int:
         with self.engine.connect() as conn:
@@ -826,81 +831,12 @@ def subtransactions(session):
     return ControlledExecution(session)
 
 
-def _get_foreign_keys(model_a: sa.sql.Alias, model_b: sa.sql.Alias) -> dict:
-
-    foreign_keys: dict = defaultdict(list)
-
-    if model_a.foreign_keys:
-
-        for key in model_a.original.foreign_keys:
-            if key._table_key() == str(model_b.original):
-                foreign_keys[str(key.parent.table)].append(key.parent)
-                foreign_keys[str(key.column.table)].append(key.column)
-
-    if not foreign_keys:
-
-        if model_b.original.foreign_keys:
-
-            for key in model_b.original.foreign_keys:
-                if key._table_key() == str(model_a.original):
-                    foreign_keys[str(key.parent.table)].append(key.parent)
-                    foreign_keys[str(key.column.table)].append(key.column)
-
-    if not foreign_keys:
-        raise ForeignKeyError(
-            f"No foreign key relationship between "
-            f'"{model_a.original}" and "{model_b.original}"'
-        )
-
-    return foreign_keys
-
-
-def get_foreign_keys(node_a: Node, node_b: Node) -> dict:
-    """Return dict of single foreign key with multiple columns.
-
-    e.g:
-        {
-            fk1['table_1']: [column_1, column_2, column_N],
-            fk2['table_2']: [column_1, column_2, column_N],
-        }
-
-    column_1, column_2, column_N are of type ForeignKeyContraint
-    """
-    foreign_keys: dict = {}
-    # if either offers a foreign_key via relationship, use it!
-    if (
-        node_a.relationship.foreign_key.parent
-        or node_b.relationship.foreign_key.parent
-    ):
-        if node_a.relationship.foreign_key.parent:
-            foreign_keys[node_a.parent.name] = sorted(
-                node_a.relationship.foreign_key.parent
-            )
-            foreign_keys[node_a.name] = sorted(
-                node_a.relationship.foreign_key.child
-            )
-        if node_b.relationship.foreign_key.parent:
-            foreign_keys[node_b.parent.name] = sorted(
-                node_b.relationship.foreign_key.parent
-            )
-            foreign_keys[node_b.name] = sorted(
-                node_b.relationship.foreign_key.child
-            )
-    else:
-        for table, columns in _get_foreign_keys(
-            node_a.model,
-            node_b.model,
-        ).items():
-            foreign_keys[table] = sorted([column.name for column in columns])
-    return foreign_keys
-
-
 def pg_engine(
     database: str,
     user: Optional[str] = None,
     host: Optional[str] = None,
     password: Optional[str] = None,
-    port: Optional[str] = None,
+    port: Optional[int] = None,
     echo: bool = False,
     sslmode: Optional[str] = None,
     sslrootcert: Optional[str] = None,
@@ -914,7 +850,7 @@ def pg_engine(
             user: Optional[str] = None,
             host: Optional[str] = None,
             password: Optional[str] = None,
-            port: Optional[str] = None,
+            port: Optional[int] = None,
             echo: bool = False,
             sslmode: Optional[str] = None,
             sslrootcert: Optional[str] = None,
@@ -962,14 +898,14 @@ def _pg_engine(
     user: Optional[str] = None,
     host: Optional[str] = None,
     password: Optional[str] = None,
-    port: Optional[str] = None,
+    port: Optional[int] = None,
     echo: bool = False,
     sslmode: Optional[str] = None,
     sslrootcert: Optional[str] = None,
 ) -> sa.engine.Engine:
     connect_args: dict = {}
-    sslmode: str = sslmode or PG_SSLMODE
-    sslrootcert: str = sslrootcert or PG_SSLROOTCERT
+    sslmode = sslmode or PG_SSLMODE
+    sslrootcert = sslrootcert or PG_SSLROOTCERT
 
     if sslmode:
         if sslmode not in (
@@ -1008,7 +944,7 @@ def pg_execute(
     values: Optional[list] = None,
     options: Optional[dict] = None,
 ) -> None:
-    options: dict = options or {"isolation_level": "AUTOCOMMIT"}
+    options = options or {"isolation_level": "AUTOCOMMIT"}
     conn = engine.connect()
     try:
         if options:

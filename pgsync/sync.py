@@ -11,17 +11,16 @@ import select
 import sys
 import time
 from collections import defaultdict
-from typing import AnyStr, Dict, Generator, List, Optional, Set
+from typing import AnyStr, Generator, List, Optional, Set
 
 import click
 import sqlalchemy as sa
 import sqlparse
 from psycopg2 import OperationalError
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-from sqlalchemy.sql import Values
 
 from . import __version__
-from .base import Base, get_foreign_keys, TupleIdentifierType
+from .base import Base, Payload
 from .constants import (
     DELETE,
     INSERT,
@@ -38,7 +37,6 @@ from .exc import (
     PrimaryKeyNotFoundError,
     RDSError,
     SchemaError,
-    SuperUserError,
 )
 from .node import Node, Tree
 from .plugin import Plugins
@@ -56,11 +54,12 @@ from .settings import (
     REPLICATION_SLOT_CLEANUP_INTERVAL,
     USE_ASYNC,
 )
-from .transform import get_private_keys, Transform
+from .transform import Transform
 from .utils import (
     compiled_query,
     exception,
     get_config,
+    load_config,
     show_settings,
     threaded,
     Timer,
@@ -79,9 +78,9 @@ class Sync(Base):
         validate: bool = True,
         repl_slots: bool = True,
         **kwargs,
-    ):
+    ) -> None:
         """Constructor."""
-        self.index: str = document["index"]
+        self.index: str = document.get("index") or document["database"]
         self.pipeline: str = document.get("pipeline")
         self.plugins: list = document.get("plugins", [])
         self.nodes: dict = document.get("nodes", {})
@@ -119,6 +118,7 @@ class Sync(Base):
             )
 
         self.connect()
+
         if self.plugins:
             self._plugins: Plugins = Plugins("plugins", self.plugins)
 
@@ -140,35 +140,26 @@ class Sync(Base):
                 "Enable logical decoding by setting wal_level = logical"
             )
 
+        self._can_create_replication_slot("_tmp_")
+
         rds_logical_replication: Optional[str] = self.pg_settings(
             "rds.logical_replication"
         )
-
-        if rds_logical_replication:
-            if rds_logical_replication.lower() == "off":
-                raise RDSError("rds.logical_replication is not enabled")
-        else:
-            if not self.has_permissions(
-                self.engine.url.username,
-                ["usesuper", "userepl"],
-            ):
-                raise SuperUserError(
-                    f'PG_USER "{self.engine.url.username}" needs to be '
-                    f"superuser or have replication role permission to "
-                    f"perform this action. "
-                    f"Ensure usesuper or userepl is True in pg_user"
-                )
+        if (
+            rds_logical_replication
+            and rds_logical_replication.lower() == "off"
+        ):
+            raise RDSError("rds.logical_replication is not enabled")
 
         if self.index is None:
             raise ValueError("Index is missing for document")
 
         # ensure we have run bootstrap and the replication slot exists
-        if repl_slots:
-            if not self.replication_slots(self.__name):
-                raise RuntimeError(
-                    f'Replication slot "{self.__name}" does not exist.\n'
-                    f'Make sure you have run the "bootstrap" command.'
-                )
+        if repl_slots and not self.replication_slots(self.__name):
+            raise RuntimeError(
+                f'Replication slot "{self.__name}" does not exist.\n'
+                f'Make sure you have run the "bootstrap" command.'
+            )
 
         # ensure the checkpoint dirpath is valid
         if not os.path.exists(CHECKPOINT_PATH):
@@ -183,9 +174,10 @@ class Sync(Base):
                 f"read/writable"
             )
 
-        self.root: Node = self.tree.build(self.nodes)
-        self.root.display()
-        for node in self.root.traverse_breadth_first():
+        self.tree.build(self.nodes)
+        self.tree.display()
+
+        for node in self.tree.traverse_breadth_first():
 
             if node.schema not in self.schemas:
                 raise InvalidSchemaError(
@@ -194,14 +186,14 @@ class Sync(Base):
 
             # ensure all base tables have at least one primary_key
             for table in node.base_tables:
-                model: sa.sql.Alias = self.model(table, node.schema)
+                model: sa.sql.Alias = self.models(table, node.schema)
                 if not model.primary_keys:
                     raise PrimaryKeyNotFoundError(
                         f"No primary key(s) for base table: {table}"
                     )
 
     def analyze(self) -> None:
-        for node in self.root.traverse_breadth_first():
+        for node in self.tree.traverse_breadth_first():
 
             if node.is_root:
                 continue
@@ -210,20 +202,22 @@ class Sync(Base):
                 str(primary_key.name) for primary_key in node.primary_keys
             ]
 
-            if node.relationship.through_nodes:
-                through_node: Node = node.relationship.through_nodes[0]
-                foreign_keys: dict = get_foreign_keys(
-                    node.parent,
-                    through_node,
+            foreign_keys: dict
+            if node.relationship.throughs:
+                through: Node = node.relationship.throughs[0]
+                foreign_keys = self.query_builder.get_foreign_keys(
+                    node,
+                    through,
                 )
             else:
-                foreign_keys: dict = get_foreign_keys(
+                foreign_keys = self.query_builder.get_foreign_keys(
                     node.parent,
                     node,
                 )
 
+            columns: list
             for index in self.indices(node.table, node.schema):
-                columns: list = foreign_keys.get(node.name, [])
+                columns = foreign_keys.get(node.name, [])
                 if set(columns).issubset(index.get("column_names", [])) or set(
                     columns
                 ).issubset(primary_keys):
@@ -233,7 +227,7 @@ class Sync(Base):
                     )
                     break
             else:
-                columns: list = foreign_keys.get(node.name, [])
+                columns = foreign_keys.get(node.name, [])
                 sys.stdout.write(
                     f'Missing index on table "{node.table}" for columns: '
                     f"{columns}\n"
@@ -253,7 +247,7 @@ class Sync(Base):
         """Create Elasticsearch setting and mapping if required."""
         self.es._create_setting(
             self.index,
-            self.root,
+            self.tree,
             setting=self.setting,
             mapping=self.mapping,
             routing=self.routing,
@@ -271,14 +265,11 @@ class Sync(Base):
             # tables with user defined foreign keys
             user_defined_fkey_tables: dict = {}
 
-            for node in self.root.traverse_breadth_first():
+            for node in self.tree.traverse_breadth_first():
                 if node.schema != schema:
                     continue
                 tables |= set(
-                    [
-                        through_node.table
-                        for through_node in node.relationship.through_nodes
-                    ]
+                    [through.table for through in node.relationship.throughs]
                 )
                 tables |= set([node.table])
                 # we also need to bootstrap the base tables
@@ -319,12 +310,9 @@ class Sync(Base):
 
         for schema in self.schemas:
             tables: Set = set()
-            for node in self.root.traverse_breadth_first():
+            for node in self.tree.traverse_breadth_first():
                 tables |= set(
-                    [
-                        through_node.table
-                        for through_node in node.relationship.through_nodes
-                    ]
+                    [through.table for through in node.relationship.throughs]
                 )
                 tables |= set([node.table])
                 # we also need to teardown the base tables
@@ -347,7 +335,10 @@ class Sync(Base):
         return f"{PRIMARY_KEY_DELIMITER}".join(map(str, primary_keys))
 
     def logical_slot_changes(
-        self, txmin: Optional[int] = None, txmax: Optional[int] = None
+        self,
+        txmin: Optional[int] = None,
+        txmax: Optional[int] = None,
+        upto_nchanges: Optional[int] = None,
     ) -> None:
         """
         Process changes from the db logical replication logs.
@@ -382,14 +373,14 @@ class Sync(Base):
             self.__name,
             txmin=txmin,
             txmax=txmax,
-            upto_nchanges=None,
+            upto_nchanges=upto_nchanges,
         )
         while True:
             changes: int = self.logical_slot_peek_changes(
                 self.__name,
                 txmin=txmin,
                 txmax=txmax,
-                upto_nchanges=None,
+                upto_nchanges=upto_nchanges,
                 limit=limit,
                 offset=offset,
             )
@@ -404,13 +395,13 @@ class Sync(Base):
                     continue
                 rows.append(row)
 
-            payloads: list = []
+            payloads: List[Payload] = []
             for i, row in enumerate(rows):
                 logger.debug(f"txid: {row.xid}")
                 logger.debug(f"data: {row.data}")
                 # TODO: optimize this so we are not parsing the same row twice
                 try:
-                    payload = self.parse_logical_slot(row.data)
+                    payload: Payload = self.parse_logical_slot(row.data)
                 except Exception as e:
                     logger.exception(
                         f"Error parsing row: {e}\nRow data: {row.data}"
@@ -421,7 +412,9 @@ class Sync(Base):
                 j: int = i + 1
                 if j < len(rows):
                     try:
-                        payload2 = self.parse_logical_slot(rows[j].data)
+                        payload2: Payload = self.parse_logical_slot(
+                            rows[j].data
+                        )
                     except Exception as e:
                         logger.exception(
                             f"Error parsing row: {e}\nRow data: {rows[j].data}"
@@ -429,8 +422,8 @@ class Sync(Base):
                         raise
 
                     if (
-                        payload["tg_op"] != payload2["tg_op"]
-                        or payload["table"] != payload2["table"]
+                        payload.tg_op != payload2.tg_op
+                        or payload.table != payload2.table
                     ):
                         self.es.bulk(self.index, self._payloads(payloads))
                         payloads: list = []
@@ -441,7 +434,7 @@ class Sync(Base):
                 self.__name,
                 txmin=txmin,
                 txmax=txmax,
-                upto_nchanges=None,
+                upto_nchanges=upto_nchanges,
                 limit=limit,
                 offset=offset,
             )
@@ -449,30 +442,21 @@ class Sync(Base):
             total += len(changes)
             self.count["xlog"] += len(rows)
 
-    def _payload_data(self, payload: dict) -> dict:
-        """Extract the payload data from the payload."""
-        payload_data = payload.get("new")
-        if payload["tg_op"] == DELETE:
-            if payload.get("old"):
-                payload_data = payload.get("old")
-        return payload_data
-
     def _insert_op(
-        self, node: Node, filters: dict, payloads: List[dict]
+        self, node: Node, filters: dict, payloads: List[Payload]
     ) -> dict:
 
         if node.table in self.tree.tables:
 
-            if node.table == self.root.table:
+            if node.is_root:
 
                 for payload in payloads:
-                    payload_data: dict = self._payload_data(payload)
                     primary_values = [
-                        payload_data[key]
-                        for key in self.root.model.primary_keys
+                        payload.data[key]
+                        for key in self.tree.root.model.primary_keys
                     ]
                     primary_fields = dict(
-                        zip(self.root.model.primary_keys, primary_values)
+                        zip(self.tree.root.model.primary_keys, primary_values)
                     )
                     filters[node.table].append(
                         {key: value for key, value in primary_fields.items()}
@@ -494,29 +478,30 @@ class Sync(Base):
                 )
 
                 for payload in payloads:
-                    payload_data: dict = self._payload_data(payload)
                     for i, key in enumerate(foreign_keys[node.name]):
-                        value = payload_data[key]
-                        filters[node.parent.table].append(
-                            {foreign_keys[node.parent.name][i]: value}
-                        )
+                        if key == foreign_keys[node.parent.name][i]:
+                            filters[node.parent.table].append(
+                                {
+                                    foreign_keys[node.parent.name][
+                                        i
+                                    ]: payload.data[key]
+                                }
+                            )
 
         else:
 
             # handle case where we insert into a through table
             # set the parent as the new entity that has changed
             filters[node.parent.table] = []
-            foreign_keys = get_foreign_keys(
+            foreign_keys = self.query_builder.get_foreign_keys(
                 node.parent,
                 node,
             )
 
             for payload in payloads:
-                payload_data: dict = self._payload_data(payload)
                 for i, key in enumerate(foreign_keys[node.name]):
-                    value = payload_data[key]
                     filters[node.parent.table].append(
-                        {foreign_keys[node.parent.name][i]: value}
+                        {foreign_keys[node.parent.name][i]: payload.data[key]}
                     )
 
         return filters
@@ -529,7 +514,7 @@ class Sync(Base):
         extra: dict,
     ) -> dict:
 
-        if node.table == self.root.table:
+        if node.is_root:
 
             # Here, we are performing two operations:
             # 1) Build a filter to sync the updated record(s)
@@ -539,9 +524,8 @@ class Sync(Base):
             #        and new document in Elasticsearch at the same time
             docs: list = []
             for payload in payloads:
-                payload_data: dict = self._payload_data(payload)
                 primary_values: list = [
-                    payload_data[key] for key in node.model.primary_keys
+                    payload.data[key] for key in node.model.primary_keys
                 ]
                 primary_fields: dict = dict(
                     zip(node.model.primary_keys, primary_values)
@@ -551,13 +535,13 @@ class Sync(Base):
                 )
 
                 old_values: list = []
-                for key in self.root.model.primary_keys:
-                    if key in payload.get("old").keys():
-                        old_values.append(payload.get("old")[key])
+                for key in self.tree.root.model.primary_keys:
+                    if key in payload.old.keys():
+                        old_values.append(payload.old[key])
 
                 new_values = [
-                    payload.get("new")[key]
-                    for key in self.root.model.primary_keys
+                    payload.new[key]
+                    for key in self.tree.root.model.primary_keys
                 ]
 
                 if (
@@ -565,7 +549,9 @@ class Sync(Base):
                     and old_values != new_values
                 ):
                     doc: dict = {
-                        "_id": self.get_doc_id(old_values, self.root.table),
+                        "_id": self.get_doc_id(
+                            old_values, self.tree.root.table
+                        ),
                         "_index": self.index,
                         "_op_type": "delete",
                     }
@@ -585,10 +571,8 @@ class Sync(Base):
                 _filters: list = []
                 fields: dict = defaultdict(list)
 
-                payload_data: dict = self._payload_data(payload)
-
                 primary_values: list = [
-                    payload_data[key] for key in node.model.primary_keys
+                    payload.data[key] for key in node.model.primary_keys
                 ]
                 primary_fields: dict = dict(
                     zip(node.model.primary_keys, primary_values)
@@ -596,18 +580,18 @@ class Sync(Base):
 
                 for key, value in primary_fields.items():
                     fields[key].append(value)
-                    if None in payload["new"].values():
+                    if None in payload.new.values():
                         extra["table"] = node.table
                         extra["column"] = key
 
-                if None in payload["old"].values():
+                if None in payload.old.values():
                     for key, value in primary_fields.items():
                         fields[key].append(0)
 
                 for doc_id in self.es._search(self.index, node.table, fields):
                     where = {}
                     params = doc_id.split(PRIMARY_KEY_DELIMITER)
-                    for i, key in enumerate(self.root.model.primary_keys):
+                    for i, key in enumerate(self.tree.root.model.primary_keys):
                         where[key] = params[i]
                     _filters.append(where)
 
@@ -616,7 +600,7 @@ class Sync(Base):
                     fields = defaultdict(list)
 
                     try:
-                        foreign_keys = get_foreign_keys(
+                        foreign_keys = self.query_builder.get_foreign_keys(
                             node.parent,
                             node,
                         )
@@ -627,8 +611,7 @@ class Sync(Base):
                         )
 
                     foreign_values = [
-                        payload.get("new", {}).get(k)
-                        for k in foreign_keys[node.name]
+                        payload.new.get(k) for k in foreign_keys[node.name]
                     ]
 
                     for key in [key.name for key in node.primary_keys]:
@@ -644,12 +627,14 @@ class Sync(Base):
                     ):
                         where: dict = {}
                         params = doc_id.split(PRIMARY_KEY_DELIMITER)
-                        for i, key in enumerate(self.root.model.primary_keys):
+                        for i, key in enumerate(
+                            self.tree.root.model.primary_keys
+                        ):
                             where[key] = params[i]
                         _filters.append(where)
 
                 if _filters:
-                    filters[self.root.table].extend(_filters)
+                    filters[self.tree.root.table].extend(_filters)
 
         return filters
 
@@ -658,23 +643,23 @@ class Sync(Base):
     ) -> dict:
 
         # when deleting a root node, just delete the doc in Elasticsearch
-        if node.table == self.root.table:
+        if node.is_root:
 
             docs: list = []
             for payload in payloads:
-                payload_data: dict = self._payload_data(payload)
-                self.root_primary_values: list = [
-                    payload_data[key] for key in self.root.model.primary_keys
+                primary_values: list = [
+                    payload.data[key]
+                    for key in self.tree.root.model.primary_keys
                 ]
                 doc: dict = {
                     "_id": self.get_doc_id(
-                        self.root_primary_values, self.root.table
+                        primary_values, self.tree.root.table
                     ),
                     "_index": self.index,
                     "_op_type": "delete",
                 }
                 if self.routing:
-                    doc["_routing"] = payload_data[self.routing]
+                    doc["_routing"] = payload.data[self.routing]
                 if self.es.major_version < 7 and not self.es.is_opensearch:
                     doc["_type"] = "_doc"
                 docs.append(doc)
@@ -696,9 +681,8 @@ class Sync(Base):
             # the child keys match in private, then get the root doc_id and
             # re-sync the child tables
             for payload in payloads:
-                payload_data: dict = self._payload_data(payload)
                 primary_values: list = [
-                    payload_data[key] for key in node.model.primary_keys
+                    payload.data[key] for key in node.model.primary_keys
                 ]
                 primary_fields = dict(
                     zip(node.model.primary_keys, primary_values)
@@ -712,19 +696,19 @@ class Sync(Base):
                 for doc_id in self.es._search(self.index, node.table, fields):
                     where = {}
                     params = doc_id.split(PRIMARY_KEY_DELIMITER)
-                    for i, key in enumerate(self.root.model.primary_keys):
+                    for i, key in enumerate(self.tree.root.model.primary_keys):
                         where[key] = params[i]
 
                     _filters.append(where)
 
                 if _filters:
-                    filters[self.root.table].extend(_filters)
+                    filters[self.tree.root.table].extend(_filters)
 
         return filters
 
     def _truncate_op(self, node: Node, filters: dict) -> dict:
 
-        if node.table == self.root.table:
+        if node.is_root:
 
             docs: list = []
             for doc_id in self.es._search(self.index, node.table):
@@ -745,15 +729,15 @@ class Sync(Base):
             for doc_id in self.es._search(self.index, node.table):
                 where: dict = {}
                 params = doc_id.split(PRIMARY_KEY_DELIMITER)
-                for i, key in enumerate(self.root.model.primary_keys):
+                for i, key in enumerate(self.tree.root.model.primary_keys):
                     where[key] = params[i]
                 _filters.append(where)
             if _filters:
-                filters[self.root.table].extend(_filters)
+                filters[self.tree.root.table].extend(_filters)
 
         return filters
 
-    def _payloads(self, payloads: List[dict]) -> None:
+    def _payloads(self, payloads: List[Payload]) -> None:
         """
         The "payloads" is a list of payload operations to process together.
 
@@ -762,32 +746,31 @@ class Sync(Base):
 
         e.g:
         [
-            {
-                'tg_op': 'INSERT',
-                'table': 'book',
-                'old': {'id': 1},
-                'new': {'id': 4}
-            },
-            {
-                'tg_op': 'INSERT',
-                'table': 'book',
-                'old': {'id': 2},
-                'new': {'id': 5}
-            },
-            {   'tg_op': 'INSERT',
-                'table': 'book',
-                'old': {'id': 3},
-                'new': {'id': 6},
-            }
+            Payload(
+                tg_op='INSERT',
+                table='book',
+                old={'id': 1},
+                new={'id': 4},
+            ),
+            Payload(
+                tg_op='INSERT',
+                table='book',
+                old={'id': 2},
+                new={'id': 5},
+            ),
+            Payload(
+                tg_op='INSERT',
+                table='book',
+                old={'id': 3},
+                new={'id': 6},
+            ),
             ...
         ]
 
         """
-        payload: dict = payloads[0]
-        tg_op: str = payload["tg_op"]
-        table: str = payload["table"]
-        if tg_op not in TG_OP:
-            logger.exception(f"Unknown tg_op {tg_op}")
+        payload: Payload = payloads[0]
+        if payload.tg_op not in TG_OP:
+            logger.exception(f"Unknown tg_op {payload.tg_op}")
             raise
 
         # we might receive an event triggered for a table
@@ -795,31 +778,30 @@ class Sync(Base):
         # e.g a through table which we need to react to.
         # in this case, we find the parent of the through
         # table and force a re-sync.
-        if table not in self.tree.tables:
+        if payload.table not in self.tree.tables:
             return
 
-        node: Node = self.tree.get_node(self.root, table, payload["schema"])
+        node: Node = self.tree.get_node(payload.table, payload.schema)
 
         for payload in payloads:
-            payload_data: dict = self._payload_data(payload)
             # this is only required for the non truncate tg_ops
-            if payload_data:
+            if payload.data:
                 if not set(node.model.primary_keys).issubset(
-                    set(payload_data.keys())
+                    set(payload.data.keys())
                 ):
                     logger.exception(
                         f"Primary keys {node.model.primary_keys} not subset "
-                        f"of payload data {payload_data.keys()} for table "
-                        f"{payload['schema']}.{payload['table']}"
+                        f"of payload data {payload.data.keys()} for table "
+                        f"{payload.schema}.{payload.table}"
                     )
                     raise
 
-        logger.debug(f"tg_op: {tg_op} table: {node.name}")
+        logger.debug(f"tg_op: {payload.tg_op} table: {node.name}")
 
-        filters: dict = {node.table: [], self.root.table: []}
+        filters: dict = {node.table: [], self.tree.root.table: []}
         extra: dict = {}
 
-        if tg_op == INSERT:
+        if payload.tg_op == INSERT:
 
             filters = self._insert_op(
                 node,
@@ -827,7 +809,7 @@ class Sync(Base):
                 payloads,
             )
 
-        if tg_op == UPDATE:
+        if payload.tg_op == UPDATE:
 
             filters = self._update_op(
                 node,
@@ -836,7 +818,7 @@ class Sync(Base):
                 extra,
             )
 
-        if tg_op == DELETE:
+        if payload.tg_op == DELETE:
 
             filters = self._delete_op(
                 node,
@@ -844,7 +826,7 @@ class Sync(Base):
                 payloads,
             )
 
-        if tg_op == TRUNCATE:
+        if payload.tg_op == TRUNCATE:
 
             filters = self._truncate_op(node, filters)
 
@@ -854,118 +836,26 @@ class Sync(Base):
         if any(filters.values()):
             yield from self.sync(filters=filters, extra=extra)
 
-    def _build_filters(
-        self, filters: Dict[str, List[dict]], node: Node
-    ) -> None:
-        """
-        Build SQLAlchemy filters.
-
-        NB:
-        assumption dictionary is an AND and list is an OR
-
-        filters['book'] = [
-            {'id': 1, 'uid': '001'},
-            {'id': 2, 'uid': '002'}
-        ]
-        """
-        if filters.get(node.table):
-            _filters: list = []
-            keys: Set = set()
-            values: Set = set()
-            for _filter in filters.get(node.table):
-                where: list = []
-                for key, value in _filter.items():
-                    where.append(node.model.c[key] == value)
-                    keys.add(key)
-                    values.add(value)
-                _filters.append(sa.and_(*where))
-
-            node._filters.append(sa.or_(*_filters))
-
     def sync(
         self,
         filters: Optional[dict] = None,
         txmin: Optional[int] = None,
         txmax: Optional[int] = None,
         extra: Optional[dict] = None,
-        ctid: Optional[int] = None,
+        ctid: Optional[dict] = None,
     ) -> Generator:
-        if filters is None:
-            filters = {}
-
         self.query_builder.isouter = True
         self.query_builder.from_obj = None
 
-        for node in self.root.traverse_post_order():
+        for node in self.tree.traverse_post_order():
             node._subquery = None
             node._filters = []
-            node.prepare_columns()
-
-        for node in self.root.traverse_post_order():
-
-            self._build_filters(filters, node)
-
-            if node.is_root:
-
-                if ctid is not None:
-                    subquery = []
-                    for page, rows in ctid.items():
-                        subquery.append(
-                            sa.select(
-                                [
-                                    sa.cast(
-                                        sa.literal_column(f"'({page},'")
-                                        .concat(sa.column("s"))
-                                        .concat(")"),
-                                        TupleIdentifierType,
-                                    )
-                                ]
-                            ).select_from(
-                                Values(
-                                    sa.column("s"),
-                                )
-                                .data([(row,) for row in rows])
-                                .alias("s")
-                            )
-                        )
-                    if subquery:
-                        node._filters.append(
-                            sa.or_(
-                                *[
-                                    node.model.c.ctid
-                                    == sa.any_(
-                                        sa.func.ARRAY(q.scalar_subquery())
-                                    )
-                                    for q in subquery
-                                ]
-                            )
-                        )
-
-                if txmin:
-                    node._filters.append(
-                        sa.cast(
-                            sa.cast(
-                                node.model.c.xmin,
-                                sa.Text,
-                            ),
-                            sa.BigInteger,
-                        )
-                        >= txmin
-                    )
-                if txmax:
-                    node._filters.append(
-                        sa.cast(
-                            sa.cast(
-                                node.model.c.xmin,
-                                sa.Text,
-                            ),
-                            sa.BigInteger,
-                        )
-                        < txmax
-                    )
+            node.setup()
 
             try:
-                self.query_builder.build_queries(node)
+                self.query_builder.build_queries(
+                    node, filters=filters, txmin=txmin, txmax=txmax, ctid=ctid
+                )
             except Exception as e:
                 logger.exception(f"Exception {e}")
                 raise
@@ -992,7 +882,7 @@ class Sync(Base):
 
                 row: dict = Transform.transform(row, self.nodes)
 
-                row[META] = get_private_keys(keys)
+                row[META] = Transform.get_primary_keys(keys)
                 if extra:
                     if extra["table"] not in row[META]:
                         row[META][extra["table"]] = {}
@@ -1050,7 +940,9 @@ class Sync(Base):
             logger.debug(f"poll_redis: {payloads}")
             self.count["redis"] += len(payloads)
             self.refresh_views()
-            self.on_publish(payloads)
+            self.on_publish(
+                list(map(lambda payload: Payload(**payload), payloads))
+            )
         time.sleep(REDIS_POLL_INTERVAL)
 
     @threaded
@@ -1066,7 +958,9 @@ class Sync(Base):
             logger.debug(f"poll_redis: {payloads}")
             self.count["redis"] += len(payloads)
             await self.async_refresh_views()
-            await self.async_on_publish(payloads)
+            await self.async_on_publish(
+                list(map(lambda payload: Payload(**payload), payloads))
+            )
         await asyncio.sleep(REDIS_POLL_INTERVAL)
 
     @exception
@@ -1090,15 +984,15 @@ class Sync(Base):
         logger.debug(
             f'Listening to notifications on channel "{self.database}"'
         )
-        items: list = []
+        payloads: list = []
 
         while True:
             # NB: consider reducing POLL_TIMEOUT to increase throughout
             if select.select([conn], [], [], POLL_TIMEOUT) == ([], [], []):
                 # Catch any hanging items from the last poll
-                if items:
-                    self.redis.bulk_push(items)
-                    items = []
+                if payloads:
+                    self.redis.bulk_push(payloads)
+                    payloads = []
                 continue
 
             try:
@@ -1108,13 +1002,13 @@ class Sync(Base):
                 os._exit(-1)
 
             while conn.notifies:
-                if len(items) >= REDIS_WRITE_CHUNK_SIZE:
-                    self.redis.bulk_push(items)
-                    items = []
+                if len(payloads) >= REDIS_WRITE_CHUNK_SIZE:
+                    self.redis.bulk_push(payloads)
+                    payloads = []
                 notification: AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
                     payload = json.loads(notification.payload)
-                    items.append(payload)
+                    payloads.append(payload)
                     logger.debug(f"on_notify: {payload}")
                     self.count["db"] += 1
 
@@ -1146,18 +1040,18 @@ class Sync(Base):
         self._refresh_views()
 
     def _refresh_views(self) -> None:
-        for node in self.root.traverse_breadth_first():
+        for node in self.tree.traverse_breadth_first():
             if node.table in self.views(node.schema):
-                if node.table in self.materialized_views(node.schema):
+                if node.table in self._materialized_views(node.schema):
                     self.refresh_view(node.table, node.schema)
 
-    def on_publish(self, payloads: list) -> None:
+    def on_publish(self, payloads: List[Payload]) -> None:
         self._on_publish(payloads)
 
-    async def async_on_publish(self, payloads: list) -> None:
+    async def async_on_publish(self, payloads: List[Payload]) -> None:
         self._on_publish(payloads)
 
-    def _on_publish(self, payloads: list) -> None:
+    def _on_publish(self, payloads: List[Payload]) -> None:
         """
         Redis publish event handler.
 
@@ -1168,36 +1062,36 @@ class Sync(Base):
         # this is used for the views.
         # we substitute the views for the base table here
         for i, payload in enumerate(payloads):
-            for node in self.root.traverse_breadth_first():
-                if payload["table"] in node.base_tables:
-                    payloads[i]["table"] = node.table
+            for node in self.tree.traverse_breadth_first():
+                if payload.table in node.base_tables:
+                    payloads[i].table = node.table
 
         logger.debug(f"on_publish len {len(payloads)}")
         # Safe inserts are insert operations that can be performed in any order
         # Optimize the safe INSERTS
         # TODO repeat this for the other place too
         # if all payload operations are INSERTS
-        if set(map(lambda x: x["tg_op"], payloads)) == set([INSERT]):
+        if set(map(lambda x: x.tg_op, payloads)) == set([INSERT]):
 
             _payloads: dict = defaultdict(list)
 
             for payload in payloads:
-                _payloads[payload["table"]].append(payload)
+                _payloads[payload.table].append(payload)
 
             for _payload in _payloads.values():
                 self.es.bulk(self.index, self._payloads(_payload))
 
         else:
 
-            _payloads: list = []
+            _payloads: List[Payload] = []
             for i, payload in enumerate(payloads):
                 _payloads.append(payload)
                 j: int = i + 1
                 if j < len(payloads):
                     payload2 = payloads[j]
                     if (
-                        payload["tg_op"] != payload2["tg_op"]
-                        or payload["table"] != payload2["table"]
+                        payload.tg_op != payload2.tg_op
+                        or payload.table != payload2.table
                     ):
                         self.es.bulk(self.index, self._payloads(_payloads))
                         _payloads = []
@@ -1205,7 +1099,7 @@ class Sync(Base):
                     self.es.bulk(self.index, self._payloads(_payloads))
                     _payloads: list = []
 
-        txids: Set = set(map(lambda x: x["xmin"], payloads))
+        txids: Set = set(map(lambda x: x.xmin, payloads))
         # for truncate, tg_op txids is None so skip setting the checkpoint
         if txids != set([None]):
             self.checkpoint: int = min(min(txids), self.txid_current) - 1
@@ -1218,9 +1112,9 @@ class Sync(Base):
         # forward pass sync
         self.es.bulk(self.index, self.sync(txmin=txmin, txmax=txmax))
         # now sync up to txmax to capture everything we may have missed
-        self.logical_slot_changes(txmin=txmin, txmax=txmax)
+        self.logical_slot_changes(txmin=txmin, txmax=txmax, upto_nchanges=None)
         self.checkpoint: int = txmax or self.txid_current
-        self._truncate: bool = True
+        self._truncate = True
 
     @threaded
     @exception
@@ -1406,7 +1300,8 @@ def main(
     show_settings(config)
 
     with Timer():
-        for document in json.load(open(config)):
+
+        for document in load_config(config):
             sync: Sync = Sync(document, verbose=verbose, **kwargs)
 
             if analyze:
