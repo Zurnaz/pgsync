@@ -249,8 +249,9 @@ class Base(object):
     def indices(self, table: str, schema: str) -> list:
         """Get the database table indexes."""
         if (table, schema) not in self.__indices:
+            indexes = sa.inspect(self.engine).get_indexes(table, schema=schema)
             self.__indices[(table, schema)] = sorted(
-                sa.inspect(self.engine).get_indexes(table, schema=schema)
+                indexes, key=lambda d: d["name"]
             )
         return self.__indices[(table, schema)]
 
@@ -429,7 +430,7 @@ class Base(object):
             limit=limit,
             offset=offset,
         )
-        self.execute(statement)
+        self.execute(statement, options=dict(stream_results=STREAM_RESULTS))
 
     def logical_slot_peek_changes(
         self,
