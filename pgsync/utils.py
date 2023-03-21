@@ -1,24 +1,33 @@
 """PGSync utils."""
+import json
 import logging
 import os
 import sys
 import threading
 from datetime import timedelta
+from string import Template
 from time import time
-from typing import Callable, Optional
+from typing import Callable, Generator, Optional, Set
 from urllib.parse import ParseResult, urlparse
 
+import click
 import sqlalchemy as sa
 import sqlparse
 
 from .exc import SchemaError
 from .settings import CHECKPOINT_PATH, QUERY_LITERAL_BINDS, SCHEMA
-from .urls import get_elasticsearch_url, get_postgres_url, get_redis_url
+from .urls import get_postgres_url, get_redis_url, get_search_url
 
 logger = logging.getLogger(__name__)
 
-HIGHLIGHT_START = "\033[4m"
+HIGHLIGHT_BEGIN = "\033[4m"
 HIGHLIGHT_END = "\033[0m:"
+
+
+def chunks(value: list, size: int) -> list:
+    """Yield successive n-sized chunks from l"""
+    for i in range(0, len(value), size):
+        yield value[i : i + size]
 
 
 def timeit(func: Callable):
@@ -82,38 +91,39 @@ def exception(func: Callable):
 
 def get_redacted_url(result: ParseResult) -> ParseResult:
     if result.password:
-        username: str = result.username
-        hostname: str = result.hostname
-        result = result._replace(
-            netloc=f"{username}:{'*' * len(result.password)}@{hostname}"
-        )
+        username: Optional[str] = result.username
+        hostname: Optional[str] = result.hostname
+        if username and hostname:
+            result = result._replace(
+                netloc=f"{username}:{'*' * len(result.password)}@{hostname}"
+            )
     return result
 
 
 def show_settings(schema: Optional[str] = None) -> None:
     """Show settings."""
-    logger.info(f"{HIGHLIGHT_START}Settings{HIGHLIGHT_END}")
+    logger.info(f"{HIGHLIGHT_BEGIN}Settings{HIGHLIGHT_END}")
     logger.info(f'{"Schema":<10s}: {schema or SCHEMA}')
     logger.info("-" * 65)
-    logger.info(f"{HIGHLIGHT_START}Checkpoint{HIGHLIGHT_END}")
+    logger.info(f"{HIGHLIGHT_BEGIN}Checkpoint{HIGHLIGHT_END}")
     logger.info(f"Path: {CHECKPOINT_PATH}")
-    logger.info(f"{HIGHLIGHT_START}Postgres{HIGHLIGHT_END}")
+    logger.info(f"{HIGHLIGHT_BEGIN}Postgres{HIGHLIGHT_END}")
     result: ParseResult = get_redacted_url(
         urlparse(get_postgres_url("postgres"))
     )
     logger.info(f"URL: {result.geturl()}")
-    result: ParseResult = get_redacted_url(urlparse(get_elasticsearch_url()))
-    logger.info(f"{HIGHLIGHT_START}Elasticsearch{HIGHLIGHT_END}")
+    result = get_redacted_url(urlparse(get_search_url()))
+    logger.info(f"{HIGHLIGHT_BEGIN}Search{HIGHLIGHT_END}")
     logger.info(f"URL: {result.geturl()}")
-    logger.info(f"{HIGHLIGHT_START}Redis{HIGHLIGHT_END}")
-    result: ParseResult = get_redacted_url(urlparse(get_redis_url()))
+    logger.info(f"{HIGHLIGHT_BEGIN}Redis{HIGHLIGHT_END}")
+    result = get_redacted_url(urlparse(get_redis_url()))
     logger.info(f"URL: {result.geturl()}")
     logger.info("-" * 65)
 
 
 def get_config(config: Optional[str] = None) -> str:
     """Return the schema config for PGSync."""
-    config: str = config or SCHEMA
+    config = config or SCHEMA
     if not config:
         raise SchemaError(
             "Schema config not set\n. "
@@ -125,19 +135,30 @@ def get_config(config: Optional[str] = None) -> str:
     return config
 
 
+def config_loader(config: str) -> Generator:
+    with open(config, "r") as documents:
+        for document in json.load(documents):
+            for key, value in document.items():
+                try:
+                    document[key] = Template(value).safe_substitute(os.environ)
+                except TypeError:
+                    pass
+            yield document
+
+
 def compiled_query(
-    query: str,
+    query: sa.sql.Select,
     label: Optional[str] = None,
     literal_binds: bool = QUERY_LITERAL_BINDS,
 ) -> None:
     """Compile an SQLAlchemy query with an optional label."""
-    query: str = str(
+    query = str(
         query.compile(
             dialect=sa.dialects.postgresql.dialect(),
             compile_kwargs={"literal_binds": literal_binds},
         )
     )
-    query: str = sqlparse.format(query, reindent=True, keyword_case="upper")
+    query = sqlparse.format(query, reindent=True, keyword_case="upper")
     if label:
         logger.debug(f"\033[4m{label}:\033[0m\n{query}")
         sys.stdout.write(f"\033[4m{label}:\033[0m\n{query}\n")
@@ -146,3 +167,28 @@ def compiled_query(
         sys.stdout.write(f"{query}\n")
     sys.stdout.write("-" * 79)
     sys.stdout.write("\n")
+
+
+class MutuallyExclusiveOption(click.Option):
+    def __init__(self, *args, **kwargs):
+        self.mutually_exclusive: Set = set(
+            kwargs.pop("mutually_exclusive", [])
+        )
+        help: str = kwargs.get("help", "")
+        if self.mutually_exclusive:
+            kwargs["help"] = help + (
+                f" NOTE: This argument is mutually exclusive with "
+                f" arguments: [{', '.join(self.mutually_exclusive)}]."
+            )
+        super(MutuallyExclusiveOption, self).__init__(*args, **kwargs)
+
+    def handle_parse_result(self, ctx, opts, args):
+        if self.mutually_exclusive.intersection(opts) and self.name in opts:
+            raise click.UsageError(
+                f"Illegal usage: `{self.name}` is mutually exclusive with "
+                f"arguments `{', '.join(self.mutually_exclusive)}`."
+            )
+
+        return super(MutuallyExclusiveOption, self).handle_parse_result(
+            ctx, opts, args
+        )

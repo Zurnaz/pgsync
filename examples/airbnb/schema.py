@@ -1,4 +1,3 @@
-import json
 from datetime import datetime
 
 import click
@@ -8,7 +7,7 @@ from sqlalchemy.schema import UniqueConstraint
 
 from pgsync.base import create_database, pg_engine
 from pgsync.helper import teardown
-from pgsync.utils import get_config
+from pgsync.utils import config_loader, get_config
 
 Base = declarative_base()
 
@@ -91,8 +90,8 @@ class Review(Base):
     )
 
 
-def setup(config=None):
-    for document in json.load(open(config)):
+def setup(config: str) -> None:
+    for document in config_loader(config):
         database: str = document.get("database", document["index"])
         create_database(database)
         with pg_engine(database) as engine:
@@ -108,7 +107,6 @@ def setup(config=None):
     type=click.Path(exists=True),
 )
 def main(config):
-
     config: str = get_config(config)
     teardown(config=config)
     setup(config)

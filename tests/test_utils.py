@@ -1,4 +1,5 @@
 """Utils tests."""
+import os
 from urllib.parse import ParseResult, urlparse
 
 import pytest
@@ -8,9 +9,10 @@ from mock import call, patch
 
 from pgsync.base import Base
 from pgsync.exc import SchemaError
-from pgsync.urls import get_elasticsearch_url, get_postgres_url, get_redis_url
+from pgsync.urls import get_postgres_url, get_redis_url, get_search_url
 from pgsync.utils import (
     compiled_query,
+    config_loader,
     exception,
     get_config,
     get_redacted_url,
@@ -33,8 +35,30 @@ class TestUtils(object):
         with pytest.raises(FileNotFoundError) as excinfo:
             get_config("non_existent")
         assert 'Schema config "non_existent" not found' in str(excinfo.value)
-        config = get_config("tests/fixtures/schema.json")
+        config: str = get_config("tests/fixtures/schema.json")
         assert config == "tests/fixtures/schema.json"
+
+    def test_config_loader(self):
+        os.environ["foo"] = "mydb"
+        os.environ["bar"] = "myindex"
+        config: str = get_config("tests/fixtures/schema.json")
+        data = config_loader(config)
+        assert next(data) == {
+            "database": "fakedb",
+            "index": "fake_index",
+            "nodes": {
+                "table": "book",
+                "columns": ["isbn", "title", "description"],
+            },
+        }
+        assert next(data) == {
+            "database": "mydb",
+            "index": "myindex",
+            "nodes": {
+                "table": "book",
+                "columns": ["isbn", "title", "description"],
+            },
+        }
 
     @patch("pgsync.utils.logger")
     def test_show_settings(self, mock_logger):
@@ -46,8 +70,8 @@ class TestUtils(object):
             call("Path: ./"),
             call("\x1b[4mPostgres\x1b[0m:"),
             call("URL: {get_postgres_url}"),
-            call("\x1b[4mElasticsearch\x1b[0m:"),
-            call(f"URL: {get_elasticsearch_url()}"),
+            call("\x1b[4mSearch\x1b[0m:"),
+            call(f"URL: {get_search_url()}"),
             call("\x1b[4mRedis\x1b[0m:"),
             call(f"URL: {get_redis_url}"),
         ]

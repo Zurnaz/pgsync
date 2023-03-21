@@ -1,4 +1,7 @@
 """Test helper methods."""
+
+import os
+from contextlib import contextmanager
 from typing import Optional
 
 from pgsync.node import Node
@@ -61,3 +64,32 @@ def sort_list(data: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+@contextmanager
+def override_env_var(**kwargs):
+    """Set the given value of the given environment variable or
+    unset if value is None.
+    """
+    original_values: dict = {}
+    envs_to_delete: list = []
+    for env_name, env_value in kwargs.items():
+        try:
+            original_values[env_name] = os.environ[env_name]
+            if env_value is None:
+                del os.environ[env_name]
+        except KeyError:
+            # Env var did not previouslt exist.
+            # If we are not setting it, we need to remove it.
+            if env_value is not None:
+                envs_to_delete.append(env_name)
+
+        if env_value is not None:
+            os.environ[env_name] = env_value
+
+    yield
+
+    for env_name in envs_to_delete:
+        del os.environ[env_name]
+    for env_name, original_env_value in original_values.items():
+        os.environ[env_name] = original_env_value

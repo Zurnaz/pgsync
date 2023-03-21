@@ -1,5 +1,4 @@
 import datetime
-import json
 import random
 from typing import Dict, List
 
@@ -26,7 +25,7 @@ from sqlalchemy.orm import sessionmaker
 from pgsync.base import pg_engine, subtransactions
 from pgsync.constants import DEFAULT_SCHEMA
 from pgsync.helper import teardown
-from pgsync.utils import get_config
+from pgsync.utils import config_loader, get_config
 
 
 @click.command()
@@ -38,13 +37,12 @@ from pgsync.utils import get_config
 )
 @click.option("--nsize", "-n", default=1, help="Number of dummy data samples")
 def main(config, nsize):
-
     config: str = get_config(config)
     teardown(drop_db=False, config=config)
 
-    for document in json.load(open(config)):
-
-        with pg_engine(document.get("database", document["index"])) as engine:
+    for document in config_loader(config):
+        database: str = document.get("database", document["index"])
+        with pg_engine(database) as engine:
             schema: str = document.get("schema", DEFAULT_SCHEMA)
             connection = engine.connect().execution_options(
                 schema_translate_map={None: schema}

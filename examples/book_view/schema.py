@@ -1,5 +1,3 @@
-import json
-
 import click
 import sqlalchemy as sa
 from sqlalchemy.ext.declarative import declarative_base
@@ -8,7 +6,7 @@ from sqlalchemy.schema import UniqueConstraint
 from pgsync.base import create_database, create_schema, pg_engine
 from pgsync.constants import DEFAULT_SCHEMA
 from pgsync.helper import teardown
-from pgsync.utils import get_config
+from pgsync.utils import config_loader, get_config
 from pgsync.view import CreateView
 
 Base = declarative_base()
@@ -39,8 +37,8 @@ class Book(Base):
     )
 
 
-def setup(config=None):
-    for document in json.load(open(config)):
+def setup(config: str) -> None:
+    for document in config_loader(config):
         database: str = document.get("database", document["index"])
         schema: str = document.get("schema", DEFAULT_SCHEMA)
         create_database(database)
@@ -82,7 +80,6 @@ def setup(config=None):
     type=click.Path(exists=True),
 )
 def main(config):
-
     config: str = get_config(config)
     teardown(config=config)
     setup(config)

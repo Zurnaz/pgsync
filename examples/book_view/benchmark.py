@@ -1,4 +1,3 @@
-import json
 from random import choice
 from typing import Set
 
@@ -10,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from pgsync.base import pg_engine
 from pgsync.constants import DELETE, INSERT, TG_OP, UPDATE
-from pgsync.utils import get_config, show_settings, Timer
+from pgsync.utils import config_loader, get_config, show_settings, Timer
 
 FIELDS = {
     "isbn": "isbn13",
@@ -129,14 +128,12 @@ def delete_op(session: sessionmaker, model, nsize: int) -> None:
     ),
 )
 def main(config, nsize, daemon, tg_op):
-
     show_settings()
 
     config: str = get_config(config)
-    documents: dict = json.load(open(config))
-    with pg_engine(
-        documents[0].get("database", documents[0]["index"])
-    ) as engine:
+    document: dict = next(config_loader(config))
+    database: str = document.get("database", document["index"])
+    with pg_engine(database) as engine:
         Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
         session = Session()
         model = Book

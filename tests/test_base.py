@@ -16,8 +16,8 @@ from pgsync.base import (
 )
 from pgsync.constants import DEFAULT_SCHEMA
 from pgsync.exc import (
-    InvalidPermissionError,
     LogicalSlotParseError,
+    ReplicationSlotError,
     TableNotFoundError,
 )
 from pgsync.view import CreateView, DropView
@@ -34,30 +34,38 @@ class TestBase(object):
         assert int(value) > 0
         assert pg_base.pg_settings("xyz") is None
 
-    def test_has_permissions(self, connection):
+    @patch("pgsync.base.logger")
+    def test__can_create_replication_slot(self, mock_logger, connection):
         pg_base = Base(connection.engine.url.database)
-        pg_base.verbose = False
-        assert (
-            pg_base.has_permissions(
-                connection.engine.url.username,
-                ["usesuper"],
-            )
-            is True
-        )
 
-        assert (
-            pg_base.has_permissions(
-                "spiderman",
-                ["usesuper"],
-            )
-            is False
-        )
+        pg_base.create_replication_slot("foo")
+        with patch("pgsync.base.Base.drop_replication_slot") as mock_slot:
+            with patch("pgsync.base.Base.create_replication_slot"):
+                pg_base._can_create_replication_slot("foo")
+                mock_logger.exception.assert_called_once_with(
+                    "Replication slot foo already exists"
+                )
+        assert mock_slot.call_args_list == [
+            call("foo"),
+            call("foo"),
+        ]
 
-        with pytest.raises(InvalidPermissionError):
-            pg_base.has_permissions(
-                connection.engine.url.username,
-                ["sudo"],
+        with patch("pgsync.base.Base.drop_replication_slot") as mock_slot:
+            pg_base._can_create_replication_slot("bar")
+            mock_slot.assert_called_once_with("bar")
+
+        with patch(
+            "pgsync.base.Base.create_replication_slot", side_effect=Exception
+        ) as mock_slot:
+            with pytest.raises(ReplicationSlotError) as excinfo:
+                pg_base._can_create_replication_slot("barx")
+            mock_slot.assert_called_once_with("barx")
+            msg = (
+                f'PG_USER "{pg_base.engine.url.username}" needs to be '
+                f"superuser or have permission to read, create and destroy "
+                f"replication slots to perform this action."
             )
+            assert msg in str(excinfo.value)
 
     def test_model(self, connection):
         pg_base = Base(connection.engine.url.database)
@@ -82,6 +90,7 @@ class TestBase(object):
         tables = [
             "continent",
             "country",
+            "group",
             "publisher",
             "book",
             "city",
@@ -93,6 +102,7 @@ class TestBase(object):
             "shelf",
             "author",
             "book_author",
+            "book_group",
             "rating",
             "contact",
             "contact_item",
@@ -102,7 +112,43 @@ class TestBase(object):
 
     def test_indices(self, connection):
         pg_base = Base(connection.engine.url.database)
-        assert pg_base.indices("book", "public") == []
+        assert pg_base.indices("contact_item", "public") == [
+            {
+                "name": "contact_item_contact_id_key",
+                "unique": True,
+                "column_names": ["contact_id"],
+                "include_columns": [],
+                "duplicates_constraint": "contact_item_contact_id_key",
+                "dialect_options": {"postgresql_include": []},
+            },
+            {
+                "name": "contact_item_name_key",
+                "unique": True,
+                "column_names": ["name"],
+                "include_columns": [],
+                "duplicates_constraint": "contact_item_name_key",
+                "dialect_options": {"postgresql_include": []},
+            },
+        ]
+
+    def test_columns(self, connection):
+        pg_base = Base(connection.engine.url.database)
+        assert pg_base.columns("public", "book") == [
+            "buyer_id",
+            "copyright",
+            "description",
+            "isbn",
+            "publisher_id",
+            "seller_id",
+            "tags",
+            "title",
+        ]
+        assert pg_base.columns("public", "shelf") == ["id", "shelf"]
+        assert pg_base.columns("public", "book_author") == [
+            "author_id",
+            "book_isbn",
+            "id",
+        ]
 
     @patch("pgsync.base.logger")
     @patch("pgsync.sync.Base.execute")
@@ -149,6 +195,7 @@ class TestBase(object):
                 "author",
                 "book",
                 "book_author",
+                "book_group",
                 "book_language",
                 "book_shelf",
                 "book_subject",
@@ -157,6 +204,7 @@ class TestBase(object):
                 "contact_item",
                 "continent",
                 "country",
+                "group",
                 "language",
                 "publisher",
                 "rating",
@@ -379,29 +427,26 @@ class TestBase(object):
         row = """
         table public."B1_XYZ": INSERT: "ID"[integer]:5 "CREATED_TIMESTAMP"[bigint]:222 "ADDRESS"[character varying]:'from3' "SOME_FIELD_KEY"[character varying]:'key3' "SOME_OTHER_FIELD_KEY"[character varying]:'issue3' "CHANNEL_ID"[integer]:3 "CHANNEL_NAME"[character varying]:'channel3' "ITEM_ID"[integer]:3 "MESSAGE"[character varying]:'message3' "RETRY"[integer]:4 "STATUS"[character varying]:'status' "SUBJECT"[character varying]:'sub3' "TIMESTAMP"[bigint]:33
         """  # noqa E501
-        values = pg_base.parse_logical_slot(row)
-        assert values == {
-            "new": {
-                "CHANNEL_ID": 3,
-                "CHANNEL_NAME": "channel3",
-                "CREATED_TIMESTAMP": 222,
-                "ADDRESS": "from3",
-                "ID": 5,
-                "ITEM_ID": 3,
-                "MESSAGE": "message3",
-                "RETRY": 4,
-                "SOME_FIELD_KEY": "key3",
-                "SOME_OTHER_FIELD_KEY": "issue3",
-                "STATUS": "status",
-                "SUBJECT": "sub3",
-                "TIMESTAMP": 33,
-            },
-            "old": {},
-            "schema": "public",
-            "table": "B1_XYZ",
-            "tg_op": "INSERT",
+        payload = pg_base.parse_logical_slot(row)
+        assert payload.data == {
+            "CHANNEL_ID": 3,
+            "CHANNEL_NAME": "channel3",
+            "CREATED_TIMESTAMP": 222,
+            "ADDRESS": "from3",
+            "ID": 5,
+            "ITEM_ID": 3,
+            "MESSAGE": "message3",
+            "RETRY": 4,
+            "SOME_FIELD_KEY": "key3",
+            "SOME_OTHER_FIELD_KEY": "issue3",
+            "STATUS": "status",
+            "SUBJECT": "sub3",
+            "TIMESTAMP": 33,
         }
-
+        assert payload.old == {}
+        assert payload.schema == "public"
+        assert payload.table == "B1_XYZ"
+        assert payload.tg_op == "INSERT"
         row = """
         table public."B1_XYZ": UNKNOWN: "ID"[integer]:5 "CREATED_TIMESTAMP"[bigint]:222 "ADDRESS"[character varying]:'from3' "SOME_FIELD_KEY"[character varying]:'key3' "SOME_OTHER_FIELD_KEY"[character varying]:'issue3' "CHANNEL_ID"[integer]:3 "CHANNEL_NAME"[character varying]:'channel3' "ITEM_ID"[integer]:3 "MESSAGE"[character varying]:'message3' "RETRY"[integer]:4 "STATUS"[character varying]:'status' "SUBJECT"[character varying]:'sub3' "TIMESTAMP"[bigint]:33
         """  # noqa E501

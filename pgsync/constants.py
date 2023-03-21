@@ -73,6 +73,7 @@ ELASTICSEARCH_TYPES = [
     "binary",
     "boolean",
     "byte",
+    "completion",
     "constant_keyword",
     "date",
     "date_range",
@@ -147,8 +148,6 @@ ELASTICSEARCH_MAPPING_PARAMETERS = [
     "term_vector",
 ]
 
-ELASTICSEARCH_TAGLINE = "You Know, for Search"
-
 CONCAT_TRANSFORM = "concat"
 MAPPING_TRANSFORM = "mapping"
 MOVE_TRANSFORM = "move"
@@ -180,6 +179,13 @@ TRIGGER_FUNC = "table_notify"
 # Views
 # added underscore to reduce chance of collisions
 MATERIALIZED_VIEW = "_view"
+
+MATERIALIZED_VIEW_COLUMNS = [
+    "foreign_keys",
+    "indices",
+    "primary_keys",
+    "table_name",
+]
 
 # Primary key delimiter
 PRIMARY_KEY_DELIMITER = "|"

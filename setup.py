@@ -20,16 +20,17 @@ def get_version() -> str:
 
 # Package meta-data.
 NAME = "pgsync"
-DESCRIPTION = "Postgres to Elasticsearch sync"
+DESCRIPTION = "Postgres to Elasticsearch/OpenSearch sync"
 URL = "https://github.com/toluaina/pgsync"
 AUTHOR = MAINTAINER = "Tolu Aina"
-AUTHOR_EMAIL = MAINTAINER_EMAIL = "toluaina@hotmail.com"
+AUTHOR_EMAIL = MAINTAINER_EMAIL = "tolu@pgsync.com"
 PYTHON_REQUIRES = ">=3.7.0"
 VERSION = get_version()
 INSTALL_REQUIRES = []
 KEYWORDS = [
     "pgsync",
     "elasticsearch",
+    "opensearch",
     "postgres",
     "change data capture",
 ]
@@ -41,6 +42,7 @@ CLASSIFIERS = [
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
     "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",

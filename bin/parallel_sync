@@ -5,8 +5,8 @@ Parallel sync is an experimental feature that leverages the available
 CPU's/Threads to increase throughput.
 This is can be useful for environments that have a high network latency.
 
-In this scenario, your PG database, Elasticsearch, and PGSync servers are on
-different networks with a delay between request/response time.
+In this scenario, your PG database, Elasticsearch/OpenSearch, and PGSync
+servers are on different networks with a delay between request/response time.
 The main bottleneck, in this case, is usually the roundtrip of the database
 query.
 
@@ -16,7 +16,7 @@ The delay in the next cursor fetch can slow down the overall sync
 considerably.
 
 The solution here is to perform an initial fast/parallel sync 
-to populate Elasticsearch in a single iteration.
+to populate Elasticsearch/OpenSearch in a single iteration.
 When this is complete, we can then continue to run the normal `pgsync`
 as a daemon.
 
@@ -28,7 +28,7 @@ We can use this to paginate the sync process.
 Pagination here technically implies that we are splitting each paged record
 between CPU's/Threads.
 
-This allows us to perform Elasticserch bulk inserts in parallel.
+This allows us to perform Elasticserch/OpenSearch bulk inserts in parallel.
 The "ctid" is a tuple of (page, row-number) e.g (1, 5) that identifies the
 row in a disk page.
 
@@ -42,9 +42,9 @@ and row numbers.
 """
 
 import asyncio
-import json
 import multiprocessing
 import os
+import re
 import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -55,9 +55,32 @@ from typing import Generator, Optional, Union
 import click
 import sqlalchemy as sa
 
-from pgsync.settings import BLOCK_SIZE
+from pgsync.settings import BLOCK_SIZE, CHECKPOINT_PATH
 from pgsync.sync import Sync
-from pgsync.utils import get_config, show_settings, timeit
+from pgsync.utils import (
+    compiled_query,
+    config_loader,
+    get_config,
+    show_settings,
+    timeit,
+)
+
+
+def save_ctid(page: int, row: int, name: str) -> None:
+    checkpoint_file: str = os.path.join(CHECKPOINT_PATH, f".{name}.ctid")
+    with open(checkpoint_file, "w+") as fp:
+        fp.write(f"{page},{row}\n")
+
+
+def read_ctid(name: str) -> None:
+    checkpoint_file: str = os.path.join(CHECKPOINT_PATH, f".{name}.ctid")
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file, "r") as fp:
+            pairs: str = fp.read().split()[0].split(",")
+            page = int(pairs[0])
+            row = int(pairs[1])
+            return page, row
+    return None, None
 
 
 def logical_slot_changes(
@@ -81,9 +104,10 @@ class Task:
         sync: Sync = Sync(
             self.doc, verbose=self.verbose, validate=self.validate
         )
+        sync.tree.build(sync.nodes)
         txmin: int = sync.checkpoint
         txmax: int = sync.txid_current
-        sync.es.bulk(
+        sync.search_client.bulk(
             sync.index,
             sync.sync(ctid=task, txmin=txmin, txmax=txmax),
         )
@@ -92,17 +116,71 @@ class Task:
 
 
 @timeit
-def fetch_tasks(doc: dict, block_size: Optional[int] = None) -> Generator:
-    block_size: int = block_size or BLOCK_SIZE
+def fetch_tasks(
+    doc: dict,
+    block_size: Optional[int] = None,
+) -> Generator:
+    block_size = block_size or BLOCK_SIZE
     pages: dict = {}
     sync: Sync = Sync(doc)
+    page: Optional[int] = None
+    row: Optional[int] = None
+    name: str = re.sub(
+        "[^0-9a-zA-Z_]+", "", f"{sync.database.lower()}_{sync.index}"
+    )
+    page, row = read_ctid(name=name)
     statement: sa.sql.Select = sa.select(
         [
             sa.literal_column("1").label("x"),
             sa.literal_column("1").label("y"),
             sa.column("ctid"),
         ]
-    ).select_from(sync.root.model)
+    ).select_from(sync.tree.root.model)
+
+    # filter by Page
+    if page:
+        statement = statement.where(
+            sa.cast(
+                sa.func.SPLIT_PART(
+                    sa.func.REPLACE(
+                        sa.func.REPLACE(
+                            sa.cast(sa.column("ctid"), sa.Text),
+                            "(",
+                            "",
+                        ),
+                        ")",
+                        "",
+                    ),
+                    ",",
+                    1,
+                ),
+                sa.Integer,
+            )
+            > page
+        )
+
+    # filter by Row
+    if row:
+        statement = statement.where(
+            sa.cast(
+                sa.func.SPLIT_PART(
+                    sa.func.REPLACE(
+                        sa.func.REPLACE(
+                            sa.cast(sa.column("ctid"), sa.Text),
+                            "(",
+                            "",
+                        ),
+                        ")",
+                        "",
+                    ),
+                    ",",
+                    2,
+                ),
+                sa.Integer,
+            )
+            > row
+        )
+
     i: int = 1
     for _, _, ctid in sync.fetchmany(statement):
         value: list = ctid[0].split(",")
@@ -123,11 +201,12 @@ def synchronous(
 ) -> None:
     sys.stdout.write("Synchronous\n")
     sync: Sync = Sync(doc, verbose=verbose, validate=validate)
+    sync.tree.build(sync.nodes)
     txmin: int = sync.checkpoint
     txmax: int = sync.txid_current
     index: str = sync.index
     for task in tasks:
-        sync.es.bulk(
+        sync.search_client.bulk(
             index,
             sync.sync(ctid=task, txmin=txmin, txmax=txmax),
         )
@@ -149,7 +228,7 @@ def multithreaded(
         txmax: int = sync.txid_current
         while True:
             task: dict = queue.get()
-            sync.es.bulk(
+            sync.search_client.bulk(
                 sync.index,
                 sync.sync(ctid=task, txmin=txmin, txmax=txmax),
             )
@@ -158,6 +237,8 @@ def multithreaded(
     nprocs: int = nprocs or 1
     queue: Queue = Queue()
     sync: Sync = Sync(doc, verbose=verbose, validate=validate)
+    sync.tree.build(sync.nodes)
+
     for _ in range(nprocs):
         thread: Thread = Thread(
             target=worker,
@@ -172,7 +253,6 @@ def multithreaded(
         queue.put(task)
 
     queue.join()  # block until all tasks are done
-
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
@@ -191,7 +271,6 @@ def multiprocess(
             list(executor.map(task.process, tasks))
         except Exception as e:
             sys.stdout.write(f"Exception: {e}\n")
-
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
@@ -206,13 +285,9 @@ def multithreaded_async(
     sys.stdout.write("Multi-threaded async\n")
     executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=nprocs)
     event_loop = asyncio.get_event_loop()
-    try:
-        event_loop.run_until_complete(
-            run_tasks(executor, tasks, doc, verbose=verbose, validate=validate)
-        )
-    finally:
-        event_loop.close()
-
+    event_loop.run_until_complete(
+        run_tasks(executor, tasks, doc, verbose=verbose, validate=validate)
+    )
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
@@ -231,9 +306,8 @@ def multiprocess_async(
         event_loop.run_until_complete(
             run_tasks(executor, tasks, doc, verbose=verbose, validate=validate)
         )
-    finally:
-        event_loop.close()
-
+    except KeyboardInterrupt:
+        pass
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
@@ -244,24 +318,19 @@ async def run_tasks(
     verbose: bool = False,
     validate: bool = False,
 ) -> None:
-    event_loop = asyncio.get_event_loop()
+    sync: Optional[Sync] = None
     if isinstance(executor, ThreadPoolExecutor):
         # threads can share a common Sync object
-        sync: Sync = Sync(doc, verbose=verbose, validate=validate)
-        tasks: list = [
+        sync = Sync(doc, verbose=verbose, validate=validate)
+    event_loop = asyncio.get_event_loop()
+    completed, pending = await asyncio.wait(
+        [
             event_loop.run_in_executor(
-                executor, run_task, task, sync, None, verbose, validate
+                executor, run_task, task, sync, doc, verbose, validate
             )
             for task in tasks
         ]
-    else:
-        tasks = [
-            event_loop.run_in_executor(
-                executor, run_task, task, None, doc, verbose, validate
-            )
-            for task in tasks
-        ]
-    completed, pending = await asyncio.wait(tasks)
+    )
     results: list = [task.result() for task in completed]
     print("results: {!r}".format(results))
     print("exiting")
@@ -276,13 +345,21 @@ def run_task(
 ) -> int:
     if sync is None:
         sync: Sync = Sync(doc, verbose=verbose, validate=validate)
+    sync.tree.build(sync.nodes)
     txmin: int = sync.checkpoint
     txmax: int = sync.txid_current
-    sync.es.bulk(
+    sync.search_client.bulk(
         sync.index,
         sync.sync(ctid=task, txmin=txmin, txmax=txmax),
     )
-    print("run_task complete")
+    if len(task) > 0:
+        page: int = max(task.keys())
+        row: int = max(task[page])
+        name: str = re.sub(
+            "[^0-9a-zA-Z_]+", "", f"{sync.database.lower()}_{sync.index}"
+        )
+        save_ctid(page=page, row=row, name=name)
+
     return 1
 
 
@@ -327,25 +404,26 @@ def main(config, nprocs, mode, verbose):
     """
     TODO:
     - Track progress across cpus/threads
-    - Save ctid
     - Handle KeyboardInterrupt Exception
     """
 
     show_settings()
     config: str = get_config(config)
 
-    for doc in json.load(open(config)):
-        tasks: Generator = fetch_tasks(doc)
+    for document in config_loader(config):
+        tasks: Generator = fetch_tasks(document)
         if mode == "synchronous":
-            synchronous(tasks, doc, verbose=verbose)
+            synchronous(tasks, document, verbose=verbose)
         elif mode == "multithreaded":
-            multithreaded(tasks, doc, nprocs=nprocs, verbose=verbose)
+            multithreaded(tasks, document, nprocs=nprocs, verbose=verbose)
         elif mode == "multiprocess":
-            multiprocess(tasks, doc, nprocs=nprocs, verbose=verbose)
+            multiprocess(tasks, document, nprocs=nprocs, verbose=verbose)
         elif mode == "multithreaded_async":
-            multithreaded_async(tasks, doc, nprocs=nprocs, verbose=verbose)
+            multithreaded_async(
+                tasks, document, nprocs=nprocs, verbose=verbose
+            )
         elif mode == "multiprocess_async":
-            multiprocess_async(tasks, doc, nprocs=nprocs, verbose=verbose)
+            multiprocess_async(tasks, document, nprocs=nprocs, verbose=verbose)
 
 
 if __name__ == "__main__":

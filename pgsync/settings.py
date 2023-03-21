@@ -28,6 +28,7 @@ POLL_TIMEOUT = env.float("POLL_TIMEOUT", default=0.1)
 QUERY_LITERAL_BINDS = env.bool("QUERY_LITERAL_BINDS", default=False)
 # db query chunk size (how many records to fetch at a time)
 QUERY_CHUNK_SIZE = env.int("QUERY_CHUNK_SIZE", default=10000)
+FILTER_CHUNK_SIZE = env.int("FILTER_CHUNK_SIZE", default=5000)
 # replication slot cleanup interval (in secs)
 REPLICATION_SLOT_CLEANUP_INTERVAL = env.float(
     "REPLICATION_SLOT_CLEANUP_INTERVAL",
@@ -37,8 +38,10 @@ REPLICATION_SLOT_CLEANUP_INTERVAL = env.float(
 SCHEMA = env.str("SCHEMA", default=None)
 USE_ASYNC = env.bool("USE_ASYNC", default=False)
 STREAM_RESULTS = env.bool("STREAM_RESULTS", default=True)
+# db polling interval
+POLL_INTERVAL = env.float("POLL_INTERVAL", default=0.1)
 
-# Elasticsearch:
+# Elasticsearch/OpenSearch:
 ELASTICSEARCH_API_KEY = env.str("ELASTICSEARCH_API_KEY", default=None)
 ELASTICSEARCH_API_KEY_ID = env.str("ELASTICSEARCH_API_KEY_ID", default=None)
 ELASTICSEARCH_AWS_HOSTED = env.bool("ELASTICSEARCH_AWS_HOSTED", default=False)
@@ -55,6 +58,9 @@ ELASTICSEARCH_CLIENT_CERT = env.str("ELASTICSEARCH_CLIENT_CERT", default=None)
 ELASTICSEARCH_CLIENT_KEY = env.str("ELASTICSEARCH_CLIENT_KEY", default=None)
 ELASTICSEARCH_CLOUD_ID = env.str("ELASTICSEARCH_CLOUD_ID", default=None)
 ELASTICSEARCH_HOST = env.str("ELASTICSEARCH_HOST", default="localhost")
+ELASTICSEARCH_HTTP_AUTH = env.list("ELASTICSEARCH_HTTP_AUTH", default=[])
+if ELASTICSEARCH_HTTP_AUTH:
+    ELASTICSEARCH_HTTP_AUTH = tuple(ELASTICSEARCH_HTTP_AUTH)
 ELASTICSEARCH_HTTP_COMPRESS = env.bool(
     "ELASTICSEARCH_HTTP_COMPRESS", default=True
 )
@@ -113,6 +119,17 @@ ELASTICSEARCH_USE_SSL = env.bool("ELASTICSEARCH_USE_SSL", default=False)
 ELASTICSEARCH_VERIFY_CERTS = env.bool(
     "ELASTICSEARCH_VERIFY_CERTS", default=True
 )
+
+# when using multiple threads for poll_db we need to account for other
+# threads performing deletions.
+ELASTICSEARCH_IGNORE_STATUS = env.list(
+    "ELASTICSEARCH_IGNORE_STATUS", default=[404]
+)
+ELASTICSEARCH_IGNORE_STATUS = tuple(map(int, ELASTICSEARCH_IGNORE_STATUS))
+
+ELASTICSEARCH = env.bool("ELASTICSEARCH", default=True)
+OPENSEARCH = env.bool("OPENSEARCH", default=(not ELASTICSEARCH))
+OPENSEARCH_AWS_HOSTED = env.bool("OPENSEARCH_AWS_HOSTED", default=False)
 
 # Postgres:
 PG_HOST = env.str("PG_HOST", default="localhost")
