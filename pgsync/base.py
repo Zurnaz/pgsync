@@ -50,8 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 class Payload(object):
-
-    __slots__ = ("tg_op", "table", "schema", "old", "new", "xmin")
+    __slots__ = ("tg_op", "table", "schema", "old", "new", "xmin", "indices")
 
     def __init__(
         self,
@@ -61,6 +60,7 @@ class Payload(object):
         old: dict = Optional[None],
         new: dict = Optional[None],
         xmin: int = Optional[None],
+        indices: List[str] = Optional[None],
     ):
         self.tg_op: str = tg_op
         self.table: str = table
@@ -68,6 +68,7 @@ class Payload(object):
         self.old: dict = old or {}
         self.new: dict = new or {}
         self.xmin: str = xmin
+        self.indices: List[str] = indices
 
     @property
     def data(self) -> dict:
@@ -75,6 +76,36 @@ class Payload(object):
         if self.tg_op == DELETE and self.old:
             return self.old
         return self.new
+
+    def foreign_key_constraint(self, model) -> dict:
+        """
+        {
+            'public.customer': {  referred table with a fully qualified name
+                'local': 'customer_id',
+                'remote': 'id',
+                'value': 1
+            },
+            'public.group': {  referred table with a fully qualified name
+                'local': 'group_id',
+                'remote': 'id',
+                'value': 1
+            }
+        }
+        """
+        constraints: dict = {}
+        for foreign_key in model.foreign_keys:
+            referred_table: str = str(foreign_key.constraint.referred_table)
+            constraints.setdefault(referred_table, {})
+            if foreign_key.constraint.column_keys:
+                if foreign_key.constraint.column_keys[0] in self.data:
+                    constraints[referred_table] = {
+                        "local": foreign_key.constraint.column_keys[0],
+                        "remote": foreign_key.column.name,
+                        "value": self.data[
+                            foreign_key.constraint.column_keys[0]
+                        ],
+                    }
+        return constraints
 
 
 class TupleIdentifierType(sa.types.UserDefinedType):
@@ -112,6 +143,7 @@ class Base(object):
         self.__views: dict = {}
         self.__materialized_views: dict = {}
         self.__tables: dict = {}
+        self.__columns: dict = {}
         self.verbose: bool = verbose
         self._conn = None
 
@@ -179,7 +211,7 @@ class Base(object):
             model = metadata.tables[name]
             model.append_column(sa.Column("xmin", sa.BigInteger))
             model.append_column(sa.Column("ctid"), TupleIdentifierType)
-            # support SQLQlchemy/Postgres 14 which somehow now reflects
+            # support SQLAlchemy/Postgres 14 which somehow now reflects
             # the oid column
             if "oid" not in [column.name for column in model.columns]:
                 model.append_column(
@@ -262,6 +294,15 @@ class Base(object):
                 sa.inspect(self.engine).get_table_names(schema)
             )
         return self.__tables[schema]
+
+    def columns(self, schema: str, table: str) -> list:
+        """Get the column names for a table/view."""
+        if (table, schema) not in self.__columns:
+            columns = sa.inspect(self.engine).get_columns(table, schema=schema)
+            self.__columns[(table, schema)] = sorted(
+                [column["name"] for column in columns]
+            )
+        return self.__columns[(table, schema)]
 
     def truncate_table(self, table: str, schema: str = DEFAULT_SCHEMA) -> None:
         """Truncate a table.
@@ -441,7 +482,7 @@ class Base(object):
         upto_nchanges: Optional[int] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-    ) -> List[sa.engine.row.LegacyRow]:
+    ) -> List[sa.engine.row.Row]:
         """Peek a logical replication slot without consuming changes.
 
         SELECT * FROM PG_LOGICAL_SLOT_PEEK_CHANGES('testdb', NULL, 1)
@@ -481,12 +522,17 @@ class Base(object):
 
     # Views...
     def create_view(
-        self, schema: str, tables: Set, user_defined_fkey_tables: dict
+        self,
+        index: str,
+        schema: str,
+        tables: Set,
+        user_defined_fkey_tables: dict,
     ) -> None:
         create_view(
             self.engine,
             self.models,
             self.fetchall,
+            index,
             schema,
             tables,
             user_defined_fkey_tables,
@@ -673,9 +719,7 @@ class Base(object):
 
     def parse_logical_slot(self, row: str) -> Payload:
         def _parse_logical_slot(data: str) -> Tuple[str, str]:
-
             while True:
-
                 match = LOGICAL_SLOT_SUFFIX.search(data)
                 if not match:
                     break
@@ -979,6 +1023,23 @@ def drop_database(database: str, echo: bool = False) -> None:
     with pg_engine("postgres", echo=echo) as engine:
         pg_execute(engine, sa.DDL(f'DROP DATABASE IF EXISTS "{database}"'))
     logger.debug(f"Dropped database: {database}")
+
+
+def database_exists(database: str, echo: bool = False) -> bool:
+    """Check if database is present."""
+    with pg_engine("postgres", echo=echo) as engine:
+        conn = engine.connect()
+        try:
+            row = conn.execute(
+                sa.DDL(
+                    f"SELECT 1 FROM pg_database WHERE datname = '{database}'"
+                )
+            ).first()
+            conn.close()
+        except Exception as e:
+            logger.exception(f"Exception {e}")
+            raise
+        return row is not None
 
 
 def create_extension(

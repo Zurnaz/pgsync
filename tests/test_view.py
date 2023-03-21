@@ -37,7 +37,7 @@ class TestView(object):
         yield books
         session.connection().engine.connect().close()
         session.connection().engine.dispose()
-        sync.es.close()
+        sync.search_client.close()
 
     def test_create_materialized_view(self, connection):
         """Test create materialized view."""
@@ -235,6 +235,7 @@ class TestView(object):
                 connection.engine,
                 pg_base.models,
                 fetchall,
+                "testdb",
                 DEFAULT_SCHEMA,
                 ["book", "publisher"],
                 user_defined_fkey_tables={},
@@ -254,6 +255,7 @@ class TestView(object):
                 connection.engine,
                 pg_base.models,
                 fetchall,
+                "testdb",
                 "myschema",
                 set(["book", "publisher"]),
                 user_defined_fkey_tables=user_defined_fkey_tables,

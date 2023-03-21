@@ -14,9 +14,10 @@ from pgsync.exc import (
 )
 from pgsync.node import Tree
 from pgsync.settings import NTHREADS_POLLDB
+from pgsync.singleton import Singleton
 from pgsync.sync import Sync
 
-from .helpers.utils import assert_resync_empty, noop, search, sort_list
+from .testing_utils import assert_resync_empty, noop, search, sort_list
 
 
 @pytest.mark.usefixtures("table_creator")
@@ -25,7 +26,6 @@ class TestParentSingleChildFkOnParent(object):
 
     @pytest.fixture(scope="function")
     def data(self, sync, book_cls, publisher_cls):
-
         session = sync.session
 
         books = [
@@ -56,6 +56,7 @@ class TestParentSingleChildFkOnParent(object):
             f"{sync.database}_testdb",
             upto_nchanges=None,
         )
+        Singleton._instances = {}
 
         yield books
 
@@ -79,14 +80,14 @@ class TestParentSingleChildFkOnParent(object):
         )
 
         try:
-            sync.es.teardown(index="testdb")
+            sync.search_client.teardown(index="testdb")
         except Exception:
             raise
 
         sync.redis.delete()
         session.connection().engine.connect().close()
         session.connection().engine.dispose()
-        sync.es.close()
+        sync.search_client.close()
 
     def test_relationship_object_one_to_one(self, sync, data):
         nodes = {
@@ -487,7 +488,7 @@ class TestParentSingleChildFkOnParent(object):
                 }
             ],
         }
-        sync.es.close()
+        sync.search_client.close()
         sync.tree.__post_init__()
         with pytest.raises(RelationshipTypeError) as excinfo:
             Tree(sync.models).build(nodes)
@@ -506,7 +507,7 @@ class TestParentSingleChildFkOnParent(object):
                 }
             ],
         }
-        sync.es.close()
+        sync.search_client.close()
         sync.tree.__post_init__()
         with pytest.raises(RelationshipVariantError) as excinfo:
             Tree(sync.models).build(nodes)
@@ -524,7 +525,7 @@ class TestParentSingleChildFkOnParent(object):
                 }
             ],
         }
-        sync.es.close()
+        sync.search_client.close()
         sync.tree.__post_init__()
         with pytest.raises(RelationshipAttributeError) as excinfo:
             Tree(sync.models).build(nodes)
@@ -595,6 +596,7 @@ class TestParentSingleChildFkOnParent(object):
         """Test sync updates primary_key then sync in non-concurrent mode."""
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": {
                 "table": "book",
                 "columns": ["isbn", "title"],
@@ -611,10 +613,10 @@ class TestParentSingleChildFkOnParent(object):
             },
         }
         sync = Sync(document)
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -654,10 +656,10 @@ class TestParentSingleChildFkOnParent(object):
             session.rollback()
             raise
 
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -680,7 +682,7 @@ class TestParentSingleChildFkOnParent(object):
             },
         ]
         assert_resync_empty(sync, document.get("node", {}))
-        sync.es.close()
+        sync.search_client.close()
 
     # TODO: Add another test like this and change
     # both primary key and non pkey column
@@ -690,6 +692,7 @@ class TestParentSingleChildFkOnParent(object):
         """Test sync updates primary_key and then sync in concurrent mode."""
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": {
                 "table": "book",
                 "columns": ["isbn", "title"],
@@ -706,10 +709,10 @@ class TestParentSingleChildFkOnParent(object):
             },
         }
         sync = Sync(document)
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -771,9 +774,9 @@ class TestParentSingleChildFkOnParent(object):
                             side_effect=noop,
                         ):
                             sync.receive(NTHREADS_POLLDB)
-                            sync.es.refresh("testdb")
+                            sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -796,12 +799,13 @@ class TestParentSingleChildFkOnParent(object):
             },
         ]
         assert_resync_empty(sync, document.get("node", {}))
-        sync.es.close()
+        sync.search_client.close()
 
     def test_insert_non_concurrent(self, data, book_cls, publisher_cls):
         """Test sync insert and then sync in non-concurrent mode."""
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": {
                 "table": "book",
                 "columns": ["isbn", "title"],
@@ -818,12 +822,12 @@ class TestParentSingleChildFkOnParent(object):
             },
         }
         sync = Sync(document)
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
         session = sync.session
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
         assert docs == [
             {
                 "_meta": {"publisher": {"id": [1]}},
@@ -861,10 +865,10 @@ class TestParentSingleChildFkOnParent(object):
             session.rollback()
             raise
 
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -893,7 +897,7 @@ class TestParentSingleChildFkOnParent(object):
             },
         ]
         assert_resync_empty(sync, document.get("node", {}))
-        sync.es.close()
+        sync.search_client.close()
 
     def test_update_non_primary_key_non_concurrent(
         self, data, book_cls, publisher_cls
@@ -901,6 +905,7 @@ class TestParentSingleChildFkOnParent(object):
         """Test sync update and then sync in non-concurrent mode."""
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": {
                 "table": "book",
                 "columns": ["isbn", "title"],
@@ -917,10 +922,10 @@ class TestParentSingleChildFkOnParent(object):
             },
         }
         sync = Sync(document)
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -956,10 +961,10 @@ class TestParentSingleChildFkOnParent(object):
             session.rollback()
             raise
 
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -982,7 +987,7 @@ class TestParentSingleChildFkOnParent(object):
             },
         ]
         assert_resync_empty(sync, document.get("node", {}))
-        sync.es.close()
+        sync.search_client.close()
 
     def test_update_non_primary_key_concurrent(
         self, data, book_cls, publisher_cls
@@ -990,6 +995,7 @@ class TestParentSingleChildFkOnParent(object):
         """Test sync update and then sync in concurrent mode."""
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": {
                 "table": "book",
                 "columns": ["isbn", "title"],
@@ -1006,10 +1012,10 @@ class TestParentSingleChildFkOnParent(object):
             },
         }
         sync = Sync(document)
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -1063,9 +1069,9 @@ class TestParentSingleChildFkOnParent(object):
                             side_effect=noop,
                         ):
                             sync.receive(NTHREADS_POLLDB)
-                            sync.es.refresh("testdb")
+                            sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -1088,12 +1094,13 @@ class TestParentSingleChildFkOnParent(object):
             },
         ]
         assert_resync_empty(sync, document.get("node", {}))
-        sync.es.close()
+        sync.search_client.close()
 
     def test_delete_concurrent(self, data, book_cls, publisher_cls):
         """Test sync delete and then sync in concurrent mode."""
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": {
                 "table": "book",
                 "columns": ["isbn", "title"],
@@ -1111,10 +1118,10 @@ class TestParentSingleChildFkOnParent(object):
         }
 
         sync = Sync(document)
-        sync.es.bulk(sync.index, sync.sync())
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(sync.index, sync.sync())
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -1181,9 +1188,9 @@ class TestParentSingleChildFkOnParent(object):
                             side_effect=noop,
                         ):
                             sync.receive(NTHREADS_POLLDB)
-                            sync.es.refresh("testdb")
+                            sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
@@ -1206,4 +1213,4 @@ class TestParentSingleChildFkOnParent(object):
             },
         ]
         assert_resync_empty(sync, document.get("node", {}))
-        sync.es.close()
+        sync.search_client.close()

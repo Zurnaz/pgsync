@@ -7,33 +7,52 @@ from pgsync.base import create_database, create_schema, pg_engine
 from pgsync.constants import DEFAULT_SCHEMA
 from pgsync.helper import teardown
 from pgsync.utils import config_loader, get_config
-from pgsync.view import CreateView
 
 Base = declarative_base()
 
 
-class Publisher(Base):
-    __tablename__ = "publisher"
+class Customer(Base):
+    __tablename__ = "customer"
     __table_args__ = (UniqueConstraint("name"),)
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     name = sa.Column(sa.String, nullable=False)
-    is_active = sa.Column(sa.Boolean, default=False)
 
 
-class Book(Base):
-    __tablename__ = "book"
-    __table_args__ = (UniqueConstraint("isbn"),)
-    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    isbn = sa.Column(sa.String, nullable=False)
-    title = sa.Column(sa.String, nullable=False)
-    description = sa.Column(sa.String, nullable=True)
-    copyright = sa.Column(sa.String, nullable=True)
-    publisher_id = sa.Column(
-        sa.Integer, sa.ForeignKey(Publisher.id, ondelete="CASCADE")
+class Group(Base):
+    __tablename__ = "group"
+    __table_args__ = (
+        UniqueConstraint(
+            "group_name",
+        ),
     )
-    publisher = sa.orm.relationship(
-        Publisher,
-        backref=sa.orm.backref("publishers"),
+    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
+    group_name = sa.Column(sa.String, nullable=False)
+
+
+class CustomerGroup(Base):
+    __tablename__ = "customer_group"
+    __table_args__ = (
+        UniqueConstraint(
+            "customer_id",
+            "group_id",
+        ),
+    )
+    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
+    customer_id = sa.Column(
+        sa.Integer,
+        sa.ForeignKey(Customer.id, ondelete="CASCADE"),
+    )
+    customer = sa.orm.relationship(
+        Customer,
+        backref=sa.orm.backref("customers"),
+    )
+    group_id = sa.Column(
+        sa.Integer,
+        sa.ForeignKey(Group.id, ondelete="CASCADE"),
+    )
+    group = sa.orm.relationship(
+        Group,
+        backref=sa.orm.backref("groups"),
     )
 
 
@@ -49,27 +68,6 @@ def setup(config: str) -> None:
             )
             Base.metadata.drop_all(engine)
             Base.metadata.create_all(engine)
-
-            metadata = sa.MetaData(schema=schema)
-            metadata.reflect(engine, views=True)
-
-            book_model = metadata.tables[f"{schema}.book"]
-            engine.execute(
-                CreateView(
-                    schema,
-                    "book_view",
-                    book_model.select(),
-                )
-            )
-
-            publisher_model = metadata.tables[f"{schema}.publisher"]
-            engine.execute(
-                CreateView(
-                    schema,
-                    "publisher_view",
-                    publisher_model.select(),
-                )
-            )
 
 
 @click.command()

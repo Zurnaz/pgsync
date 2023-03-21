@@ -27,21 +27,27 @@ class QueryBuilder(object):
 
         NB:
         assumption dictionary is an AND and list is an OR
-
-        filters['book'] = [
-            {'id': 1, 'uid': '001'},
-            {'id': 2, 'uid': '002'}
-        ]
+        filters = {
+            'book': [
+                {'id': 1, 'uid': '001'},
+                {'id': 2, 'uid': '002'},
+            ],
+            'city': [
+                {'id': 1},
+                {'id': 2},
+            ],
+        }
         """
         if filters is not None:
             if filters.get(node.table):
-                _filters: list = []
-                for _filter in filters.get(node.table):
+                clause: list = []
+                for values in filters.get(node.table):
                     where: list = []
-                    for key, value in _filter.items():
-                        where.append(node.model.c[key] == value)
-                    _filters.append(sa.and_(*where))
-                return sa.or_(*_filters)
+                    for column, value in values.items():
+                        where.append(node.model.c[column] == value)
+                    # and clause is applied for composite primary keys
+                    clause.append(sa.and_(*where))
+                return sa.or_(*clause)
 
     def _json_build_object(
         self, columns: list, chunk_size: int = 100
@@ -58,7 +64,7 @@ class QueryBuilder(object):
         i: int = 0
         expression: sa.sql.elements.BinaryExpression = None
         while i < len(columns):
-            chunk = columns[i : i + chunk_size]
+            chunk: list = columns[i : i + chunk_size]
             if i == 0:
                 expression = sa.cast(
                     sa.func.JSON_BUILD_OBJECT(*chunk),
@@ -81,7 +87,6 @@ class QueryBuilder(object):
     # this is for handling non-through tables
     def get_foreign_keys(self, node_a: Node, node_b: Node) -> dict:
         if (node_a, node_b) not in self._cache:
-
             foreign_keys: dict = {}
             # if either offers a foreign_key via relationship, use it!
             if (
@@ -145,7 +150,6 @@ class QueryBuilder(object):
         """This is for handling through nodes."""
         if (node_a, node_b) not in self._cache:
             if node_a.relationship.throughs or node_b.relationship.throughs:
-
                 if node_a.relationship.throughs:
                     through: Node = node_a.relationship.throughs[0]
 
@@ -327,13 +331,10 @@ class QueryBuilder(object):
             node._subquery = node._subquery.lateral()
 
     def _children(self, node: Node) -> None:
-
         for child in node.children:
-
             onclause: List = []
 
             if child.relationship.throughs:
-
                 child.parent.columns.extend(
                     [
                         child.label,
@@ -364,7 +365,6 @@ class QueryBuilder(object):
                     )
 
             else:
-
                 child.parent.columns.extend(
                     [
                         child.label,
@@ -399,7 +399,6 @@ class QueryBuilder(object):
                 self.isouter = False
                 for _filter in child._filters:
                     if isinstance(_filter, sa.sql.elements.BinaryExpression):
-
                         for column in _filter._orig:
                             if hasattr(column, "value"):
                                 _column = child._subquery.c
@@ -415,7 +414,6 @@ class QueryBuilder(object):
                         sa.sql.elements.BooleanClauseList,
                     ):
                         for clause in _filter.clauses:
-
                             for column in clause._orig:
                                 if hasattr(column, "value"):
                                     _column = child._subquery.c
@@ -439,7 +437,6 @@ class QueryBuilder(object):
             )
 
     def _through(self, node: Node) -> None:  # noqa: C901
-
         through: Node = node.relationship.throughs[0]
         foreign_keys: dict = self.get_foreign_keys(node, through)
 
@@ -476,9 +473,7 @@ class QueryBuilder(object):
         if node.relationship.variant == SCALAR:
             columns.append(node.columns[1].label("anon"))
         elif node.relationship.variant == OBJECT:
-
             if node.relationship.type == ONE_TO_ONE:
-
                 if not node.children:
                     columns.append(
                         sa.func.JSON_BUILD_OBJECT(
@@ -505,11 +500,9 @@ class QueryBuilder(object):
         from_obj = None
 
         for child in node.children:
-
             onclause = []
 
             if child.relationship.throughs:
-
                 child_through: Node = child.relationship.throughs[0]
                 child_foreign_keys: dict = self.get_foreign_keys(
                     child, child_through
@@ -533,7 +526,6 @@ class QueryBuilder(object):
                 )
 
             else:
-
                 child_foreign_keys: dict = self.get_foreign_keys(
                     child.parent, child
                 )
@@ -558,7 +550,6 @@ class QueryBuilder(object):
 
                 for _filter in child._filters:
                     if isinstance(_filter, sa.sql.elements.BinaryExpression):
-
                         for column in _filter._orig:
                             if hasattr(column, "value"):
                                 _column = child._subquery.c
@@ -577,7 +568,6 @@ class QueryBuilder(object):
                         sa.sql.elements.BooleanClauseList,
                     ):
                         for clause in _filter.clauses:
-
                             for column in clause._orig:
                                 if hasattr(column, "value"):
                                     _column = child._subquery.c
@@ -705,18 +695,22 @@ class QueryBuilder(object):
             node._subquery = node._subquery.lateral()
 
     def _non_through(self, node: Node) -> None:  # noqa: C901
-
         from_obj = None
 
         for child in node.children:
-
             onclause: list = []
 
             foreign_keys: dict = self._get_foreign_keys(node, child)
-
+            table: Optional[str] = (
+                child.relationship.throughs[0].table
+                if child.relationship.throughs
+                else None
+            )
             foreign_key_columns: list = self._get_column_foreign_keys(
                 child._subquery.columns,
                 foreign_keys,
+                table=table,
+                schema=child.schema,
             )
 
             for i in range(len(foreign_key_columns)):
@@ -748,7 +742,6 @@ class QueryBuilder(object):
                         sa.sql.elements.BooleanClauseList,
                     ):
                         for clause in _filter.clauses:
-
                             for column in clause._orig:
                                 if hasattr(column, "value"):
                                     _column = child._subquery.c

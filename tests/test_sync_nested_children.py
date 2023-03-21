@@ -6,9 +6,10 @@ import pytest
 
 from pgsync.base import subtransactions
 from pgsync.settings import NTHREADS_POLLDB
+from pgsync.singleton import Singleton
 from pgsync.sync import Sync
 
-from .helpers.utils import assert_resync_empty, noop, search, sort_list
+from .testing_utils import assert_resync_empty, noop, search, sort_list
 
 
 @pytest.mark.usefixtures("table_creator")
@@ -32,6 +33,8 @@ class TestNestedChildren(object):
         subject_cls,
         book_shelf_cls,
         shelf_cls,
+        book_group_cls,
+        group_cls,
     ):
         session = sync.session
 
@@ -230,6 +233,8 @@ class TestNestedChildren(object):
             upto_nchanges=None,
         )
 
+        Singleton._instances = {}
+
         yield (
             books,
             authors,
@@ -264,6 +269,8 @@ class TestNestedChildren(object):
                     subject_cls.__table__.name,
                     book_shelf_cls.__table__.name,
                     shelf_cls.__table__.name,
+                    book_group_cls.__table__.name,
+                    group_cls.__table__.name,
                 ]
             )
 
@@ -273,15 +280,15 @@ class TestNestedChildren(object):
         )
 
         try:
-            sync.es.teardown(index="testdb")
-            sync.es.close()
+            sync.search_client.teardown(index="testdb")
+            sync.search_client.close()
         except Exception:
             raise
 
         sync.redis.delete()
         session.connection().engine.connect().close()
         session.connection().engine.dispose()
-        sync.es.close()
+        sync.search_client.close()
 
     @pytest.fixture(scope="function")
     def nodes(self):
@@ -674,12 +681,15 @@ class TestNestedChildren(object):
 
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
 
         # 1. sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
         sync.checkpoint = sync.txid_current
 
         session = sync.session
@@ -793,16 +803,19 @@ class TestNestedChildren(object):
             },
         ]
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
     def test_update_root(self, data, nodes, book_cls):
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
         # 1. sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
         sync.checkpoint = sync.txid_current
 
         session = sync.session
@@ -904,7 +917,7 @@ class TestNestedChildren(object):
                     assert doc["_source"][key] == expected[i]["_source"][key]
 
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
     def test_delete_root(
         self,
@@ -918,11 +931,14 @@ class TestNestedChildren(object):
     ):
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
         # 1. sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
         sync.checkpoint = sync.txid_current
 
         session = sync.session
@@ -976,14 +992,14 @@ class TestNestedChildren(object):
                             side_effect=noop,
                         ):
                             sync.receive(NTHREADS_POLLDB)
-                            sync.es.refresh("testdb")
+                            sync.search_client.refresh("testdb")
 
         txmin = sync.checkpoint
         sync.tree.build(nodes)
         docs = [sort_list(doc) for doc in sync.sync(txmin=txmin)]
         assert len(docs) == 0
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert len(docs) == 2
         docs = sorted(docs, key=lambda k: k["isbn"])
@@ -1114,11 +1130,157 @@ class TestNestedChildren(object):
                     assert doc[key] == expected[i][key]
 
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
-    def test_insert_through_child_noop(self, sync, data):
-        # insert a new through child with noop
-        pass
+    def test_insert_through_child_op2(
+        self, book_cls, group_cls, book_group_cls, data
+    ):
+        # insert a new through child with op
+        nodes = {
+            "table": "book",
+            "columns": ["isbn", "title"],
+            "children": [
+                {
+                    "table": "group",
+                    "columns": ["id", "group_name"],
+                    "relationship": {
+                        "variant": "object",
+                        "type": "one_to_many",
+                        "through_tables": ["book_group"],
+                    },
+                }
+            ],
+        }
+        document = {
+            "index": "testdb",
+            "database": "testdb",
+            "nodes": nodes,
+        }
+
+        sync = Sync(document)
+        sync.tree.build(nodes)
+        session = sync.session
+
+        with subtransactions(session):
+            session.execute(book_group_cls.__table__.delete())
+            session.execute(
+                group_cls.__table__.insert().values(id=1, group_name="GroupA")
+            )
+            session.execute(
+                group_cls.__table__.insert().values(id=2, group_name="GroupB")
+            )
+
+        docs = [sort_list(doc) for doc in sync.sync()]
+        assert docs == [
+            {
+                "_id": "abc",
+                "_index": "testdb",
+                "_source": {
+                    "isbn": "abc",
+                    "group": None,
+                    "title": "The Tiger Club",
+                    "_meta": {},
+                },
+            },
+            {
+                "_id": "def",
+                "_index": "testdb",
+                "_source": {
+                    "isbn": "def",
+                    "group": None,
+                    "title": "The Lion Club",
+                    "_meta": {},
+                },
+            },
+            {
+                "_id": "ghi",
+                "_index": "testdb",
+                "_source": {
+                    "isbn": "ghi",
+                    "group": None,
+                    "title": "The Rabbit Club",
+                    "_meta": {},
+                },
+            },
+        ]
+        sync.checkpoint = sync.txid_current
+
+        def pull():
+            txmin = sync.checkpoint
+            txmax = sync.txid_current
+            sync.logical_slot_changes(txmin=txmin, txmax=txmax)
+
+        def poll_redis():
+            return []
+
+        def poll_db():
+            with subtransactions(session):
+                session.execute(
+                    book_group_cls.__table__.insert().values(
+                        book_isbn="abc", group_id=1
+                    )
+                )
+                session.execute(
+                    book_group_cls.__table__.insert().values(
+                        book_isbn="abc", group_id=2
+                    )
+                )
+
+        with mock.patch("pgsync.sync.Sync.poll_redis", side_effect=poll_redis):
+            with mock.patch("pgsync.sync.Sync.poll_db", side_effect=poll_db):
+                with mock.patch("pgsync.sync.Sync.pull", side_effect=pull):
+                    with mock.patch(
+                        "pgsync.sync.Sync.truncate_slots",
+                        side_effect=noop,
+                    ):
+                        with mock.patch(
+                            "pgsync.sync.Sync.status",
+                            side_effect=noop,
+                        ):
+                            sync.receive(NTHREADS_POLLDB)
+                            sync.search_client.refresh("testdb")
+
+        docs = [sort_list(doc) for doc in sync.sync()]
+        # all authors are none, also no book_authors
+        assert docs == [
+            {
+                "_id": "abc",
+                "_index": "testdb",
+                "_source": {
+                    "isbn": "abc",
+                    "group": [
+                        {"id": 1, "group_name": "GroupA"},
+                        {"id": 2, "group_name": "GroupB"},
+                    ],
+                    "title": "The Tiger Club",
+                    "_meta": {
+                        "group": {"id": [1, 2]},
+                        "book_group": {"id": [1, 2]},
+                    },
+                },
+            },
+            {
+                "_id": "def",
+                "_index": "testdb",
+                "_source": {
+                    "isbn": "def",
+                    "group": None,
+                    "title": "The Lion Club",
+                    "_meta": {},
+                },
+            },
+            {
+                "_id": "ghi",
+                "_index": "testdb",
+                "_source": {
+                    "isbn": "ghi",
+                    "group": None,
+                    "title": "The Rabbit Club",
+                    "_meta": {},
+                },
+            },
+        ]
+        sync.search_client.close()
 
     def test_update_through_child_noop(self, sync, data):
         # update a new through child with noop
@@ -1164,6 +1326,7 @@ class TestNestedChildren(object):
 
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
 
@@ -1175,10 +1338,12 @@ class TestNestedChildren(object):
         with subtransactions(session):
             session.add(book_author)
 
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert len(docs) == 3
         docs = sorted(docs, key=lambda k: k["isbn"])
@@ -1377,7 +1542,8 @@ class TestNestedChildren(object):
                     assert doc[key] == expected[i][key]
 
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+
+        sync.search_client.close()
 
     def test_update_through_child_op(
         self,
@@ -1393,12 +1559,15 @@ class TestNestedChildren(object):
         # update a new through child with op
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
 
         # 1. sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
 
         author = author_cls(
             id=5,
@@ -1426,10 +1595,12 @@ class TestNestedChildren(object):
                 .values(author_id=5)
             )
 
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert len(docs) == 3
         docs = sorted(docs, key=lambda k: k["isbn"])
@@ -1614,18 +1785,21 @@ class TestNestedChildren(object):
                     assert doc[key] == expected[i][key]
 
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
     def test_delete_through_child_op(self, sync, data, nodes, book_author_cls):
         # delete a new through child with op
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
 
         # 1. sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
 
         session = sync.session
 
@@ -1637,10 +1811,12 @@ class TestNestedChildren(object):
             )
             session.commit()
 
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
-        sync.es.refresh("testdb")
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert len(docs) == 3
         docs = sorted(docs, key=lambda k: k["isbn"])
@@ -1793,7 +1969,7 @@ class TestNestedChildren(object):
                     assert doc[key] == expected[i][key]
 
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
     def test_insert_nonthrough_child_noop(
         self,
@@ -1816,16 +1992,19 @@ class TestNestedChildren(object):
 
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
 
         # 1. sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
         sync.checkpoint = sync.txid_current
-        sync.es.refresh("testdb")
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert len(docs) == 3
 
@@ -1839,22 +2018,23 @@ class TestNestedChildren(object):
         assert len(docs) == 0
 
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
     def test_update_nonthrough_child_noop(self, data, nodes, shelf_cls):
         # update a new non-through child with noop
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
 
         # 1. sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, sync.sync())
+        sync.search_client.bulk(sync.index, sync.sync())
         sync.checkpoint = sync.txid_current
-        sync.es.refresh("testdb")
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert len(docs) == 3
 
@@ -1872,23 +2052,24 @@ class TestNestedChildren(object):
         assert len(docs) == 0
 
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
     def test_delete_nonthrough_child_noop(self, data, nodes, shelf_cls):
         # delete a new non-through child with noop
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
 
         # 1. sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, sync.sync())
+        sync.search_client.bulk(sync.index, sync.sync())
         sync.checkpoint = sync.txid_current
         sync.checkpoint = sync.txid_current
-        sync.es.refresh("testdb")
+        sync.search_client.refresh("testdb")
 
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
 
         assert len(docs) == 3
 
@@ -1906,7 +2087,7 @@ class TestNestedChildren(object):
         assert len(docs) == 0
 
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
     def test_insert_nonthrough_child_op(self, sync, data):
         # insert a new non-through child with op
@@ -2031,14 +2212,17 @@ class TestNestedChildren(object):
 
         document = {
             "index": "testdb",
+            "database": "testdb",
             "nodes": nodes,
         }
         # sync first to add the initial document
         sync = Sync(document)
-        sync.es.bulk(sync.index, [sort_list(doc) for doc in sync.sync()])
+        sync.search_client.bulk(
+            sync.index, [sort_list(doc) for doc in sync.sync()]
+        )
         sync.checkpoint = sync.txid_current
         session = sync.session
-        sync.es.refresh("testdb")
+        sync.search_client.refresh("testdb")
 
         def pull():
             txmin = sync.checkpoint
@@ -2064,15 +2248,15 @@ class TestNestedChildren(object):
                             side_effect=noop,
                         ):
                             sync.receive(NTHREADS_POLLDB)
-                            sync.es.refresh("testdb")
+                            sync.search_client.refresh("testdb")
 
         txmin = sync.checkpoint
         sync.tree.build(nodes)
         docs = [sort_list(doc) for doc in sync.sync(txmin=txmin)]
         assert docs == []
-        docs = search(sync.es, "testdb")
+        docs = search(sync.search_client, "testdb")
         assert_resync_empty(sync, nodes)
-        sync.es.close()
+        sync.search_client.close()
 
     def test_insert_deep_nested_fk_nonthrough_child_op(
         self,

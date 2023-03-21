@@ -5,8 +5,8 @@ Parallel sync is an experimental feature that leverages the available
 CPU's/Threads to increase throughput.
 This is can be useful for environments that have a high network latency.
 
-In this scenario, your PG database, Elasticsearch, and PGSync servers are on
-different networks with a delay between request/response time.
+In this scenario, your PG database, Elasticsearch/OpenSearch, and PGSync
+servers are on different networks with a delay between request/response time.
 The main bottleneck, in this case, is usually the roundtrip of the database
 query.
 
@@ -16,7 +16,7 @@ The delay in the next cursor fetch can slow down the overall sync
 considerably.
 
 The solution here is to perform an initial fast/parallel sync 
-to populate Elasticsearch in a single iteration.
+to populate Elasticsearch/OpenSearch in a single iteration.
 When this is complete, we can then continue to run the normal `pgsync`
 as a daemon.
 
@@ -28,7 +28,7 @@ We can use this to paginate the sync process.
 Pagination here technically implies that we are splitting each paged record
 between CPU's/Threads.
 
-This allows us to perform Elasticserch bulk inserts in parallel.
+This allows us to perform Elasticserch/OpenSearch bulk inserts in parallel.
 The "ctid" is a tuple of (page, row-number) e.g (1, 5) that identifies the
 row in a disk page.
 
@@ -59,8 +59,8 @@ from pgsync.settings import BLOCK_SIZE, CHECKPOINT_PATH
 from pgsync.sync import Sync
 from pgsync.utils import (
     compiled_query,
+    config_loader,
     get_config,
-    load_config,
     show_settings,
     timeit,
 )
@@ -107,7 +107,7 @@ class Task:
         sync.tree.build(sync.nodes)
         txmin: int = sync.checkpoint
         txmax: int = sync.txid_current
-        sync.es.bulk(
+        sync.search_client.bulk(
             sync.index,
             sync.sync(ctid=task, txmin=txmin, txmax=txmax),
         )
@@ -206,7 +206,7 @@ def synchronous(
     txmax: int = sync.txid_current
     index: str = sync.index
     for task in tasks:
-        sync.es.bulk(
+        sync.search_client.bulk(
             index,
             sync.sync(ctid=task, txmin=txmin, txmax=txmax),
         )
@@ -228,7 +228,7 @@ def multithreaded(
         txmax: int = sync.txid_current
         while True:
             task: dict = queue.get()
-            sync.es.bulk(
+            sync.search_client.bulk(
                 sync.index,
                 sync.sync(ctid=task, txmin=txmin, txmax=txmax),
             )
@@ -253,7 +253,6 @@ def multithreaded(
         queue.put(task)
 
     queue.join()  # block until all tasks are done
-
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
@@ -272,7 +271,6 @@ def multiprocess(
             list(executor.map(task.process, tasks))
         except Exception as e:
             sys.stdout.write(f"Exception: {e}\n")
-
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
@@ -287,13 +285,9 @@ def multithreaded_async(
     sys.stdout.write("Multi-threaded async\n")
     executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=nprocs)
     event_loop = asyncio.get_event_loop()
-    try:
-        event_loop.run_until_complete(
-            run_tasks(executor, tasks, doc, verbose=verbose, validate=validate)
-        )
-    finally:
-        event_loop.close()
-
+    event_loop.run_until_complete(
+        run_tasks(executor, tasks, doc, verbose=verbose, validate=validate)
+    )
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
@@ -314,9 +308,6 @@ def multiprocess_async(
         )
     except KeyboardInterrupt:
         pass
-    finally:
-        event_loop.close()
-
     logical_slot_changes(doc, verbose=verbose, validate=validate)
 
 
@@ -327,24 +318,19 @@ async def run_tasks(
     verbose: bool = False,
     validate: bool = False,
 ) -> None:
-    event_loop = asyncio.get_event_loop()
+    sync: Optional[Sync] = None
     if isinstance(executor, ThreadPoolExecutor):
         # threads can share a common Sync object
-        sync: Sync = Sync(doc, verbose=verbose, validate=validate)
-        tasks: list = [
+        sync = Sync(doc, verbose=verbose, validate=validate)
+    event_loop = asyncio.get_event_loop()
+    completed, pending = await asyncio.wait(
+        [
             event_loop.run_in_executor(
-                executor, run_task, task, sync, None, verbose, validate
+                executor, run_task, task, sync, doc, verbose, validate
             )
             for task in tasks
         ]
-    else:
-        tasks = [
-            event_loop.run_in_executor(
-                executor, run_task, task, None, doc, verbose, validate
-            )
-            for task in tasks
-        ]
-    completed, pending = await asyncio.wait(tasks)
+    )
     results: list = [task.result() for task in completed]
     print("results: {!r}".format(results))
     print("exiting")
@@ -362,7 +348,7 @@ def run_task(
     sync.tree.build(sync.nodes)
     txmin: int = sync.checkpoint
     txmax: int = sync.txid_current
-    sync.es.bulk(
+    sync.search_client.bulk(
         sync.index,
         sync.sync(ctid=task, txmin=txmin, txmax=txmax),
     )
@@ -418,14 +404,13 @@ def main(config, nprocs, mode, verbose):
     """
     TODO:
     - Track progress across cpus/threads
-    - Save ctid
     - Handle KeyboardInterrupt Exception
     """
 
     show_settings()
     config: str = get_config(config)
 
-    for document in load_config(config):
+    for document in config_loader(config):
         tasks: Generator = fetch_tasks(document)
         if mode == "synchronous":
             synchronous(tasks, document, verbose=verbose)

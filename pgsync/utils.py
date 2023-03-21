@@ -7,20 +7,27 @@ import threading
 from datetime import timedelta
 from string import Template
 from time import time
-from typing import Callable, Generator, Optional
+from typing import Callable, Generator, Optional, Set
 from urllib.parse import ParseResult, urlparse
 
+import click
 import sqlalchemy as sa
 import sqlparse
 
 from .exc import SchemaError
 from .settings import CHECKPOINT_PATH, QUERY_LITERAL_BINDS, SCHEMA
-from .urls import get_elasticsearch_url, get_postgres_url, get_redis_url
+from .urls import get_postgres_url, get_redis_url, get_search_url
 
 logger = logging.getLogger(__name__)
 
 HIGHLIGHT_BEGIN = "\033[4m"
 HIGHLIGHT_END = "\033[0m:"
+
+
+def chunks(value: list, size: int) -> list:
+    """Yield successive n-sized chunks from l"""
+    for i in range(0, len(value), size):
+        yield value[i : i + size]
 
 
 def timeit(func: Callable):
@@ -105,8 +112,8 @@ def show_settings(schema: Optional[str] = None) -> None:
         urlparse(get_postgres_url("postgres"))
     )
     logger.info(f"URL: {result.geturl()}")
-    result = get_redacted_url(urlparse(get_elasticsearch_url()))
-    logger.info(f"{HIGHLIGHT_BEGIN}Elasticsearch{HIGHLIGHT_END}")
+    result = get_redacted_url(urlparse(get_search_url()))
+    logger.info(f"{HIGHLIGHT_BEGIN}Search{HIGHLIGHT_END}")
     logger.info(f"URL: {result.geturl()}")
     logger.info(f"{HIGHLIGHT_BEGIN}Redis{HIGHLIGHT_END}")
     result = get_redacted_url(urlparse(get_redis_url()))
@@ -128,7 +135,7 @@ def get_config(config: Optional[str] = None) -> str:
     return config
 
 
-def load_config(config: str) -> Generator:
+def config_loader(config: str) -> Generator:
     with open(config, "r") as documents:
         for document in json.load(documents):
             for key, value in document.items():
@@ -160,3 +167,28 @@ def compiled_query(
         sys.stdout.write(f"{query}\n")
     sys.stdout.write("-" * 79)
     sys.stdout.write("\n")
+
+
+class MutuallyExclusiveOption(click.Option):
+    def __init__(self, *args, **kwargs):
+        self.mutually_exclusive: Set = set(
+            kwargs.pop("mutually_exclusive", [])
+        )
+        help: str = kwargs.get("help", "")
+        if self.mutually_exclusive:
+            kwargs["help"] = help + (
+                f" NOTE: This argument is mutually exclusive with "
+                f" arguments: [{', '.join(self.mutually_exclusive)}]."
+            )
+        super(MutuallyExclusiveOption, self).__init__(*args, **kwargs)
+
+    def handle_parse_result(self, ctx, opts, args):
+        if self.mutually_exclusive.intersection(opts) and self.name in opts:
+            raise click.UsageError(
+                f"Illegal usage: `{self.name}` is mutually exclusive with "
+                f"arguments `{', '.join(self.mutually_exclusive)}`."
+            )
+
+        return super(MutuallyExclusiveOption, self).handle_parse_result(
+            ctx, opts, args
+        )
