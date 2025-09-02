@@ -24,34 +24,32 @@ DESCRIPTION = "Postgres to Elasticsearch/OpenSearch sync"
 URL = "https://github.com/toluaina/pgsync"
 AUTHOR = MAINTAINER = "Tolu Aina"
 AUTHOR_EMAIL = MAINTAINER_EMAIL = "tolu@pgsync.com"
-PYTHON_REQUIRES = ">=3.7.0"
+PYTHON_REQUIRES = ">=3.9.0"
 VERSION = get_version()
 INSTALL_REQUIRES = []
 KEYWORDS = [
-    "pgsync",
+    "change data capture",
     "elasticsearch",
     "opensearch",
+    "pgsync",
     "postgres",
-    "change data capture",
 ]
+LICENSE = "MIT"
 CLASSIFIERS = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Natural Language :: English",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
-    "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
 ]
-SCRIPTS = [
-    "bin/pgsync",
-    "bin/bootstrap",
-    "bin/parallel_sync",
-]
+SCRIPTS = ["bin/bootstrap", "bin/parallel_sync", "bin/pgsync"]
 SETUP_REQUIRES = ["pytest-runner"]
 TESTS_REQUIRE = ["pytest"]
 
@@ -61,13 +59,13 @@ PACKAGES = find_packages(include=["pgsync"])
 with open("README.rst") as fp:
     README = fp.read()
 
-with open("requirements/prod.txt") as fp:
+with open("requirements/base.txt") as fp:
     INSTALL_REQUIRES = fp.read()
 
 setup(
     name=NAME,
     author=AUTHOR,
-    license="LGPLv3",
+    license=LICENSE,
     maintainer=MAINTAINER,
     maintainer_email=MAINTAINER_EMAIL,
     author_email=AUTHOR_EMAIL,

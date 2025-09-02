@@ -1,10 +1,12 @@
+import typing as t
+
 import click
 from schema import Specie, Structure, Unit
 from sqlalchemy.orm import sessionmaker
 
 from pgsync.base import pg_engine, subtransactions
 from pgsync.helper import teardown
-from pgsync.utils import config_loader, get_config
+from pgsync.utils import config_loader, validate_config
 
 
 @click.command()
@@ -14,16 +16,16 @@ from pgsync.utils import config_loader, get_config
     help="Schema config",
     type=click.Path(exists=True),
 )
-def main(config):
-    config: str = get_config(config)
+def main(config: str) -> None:
+    validate_config(config)
     teardown(drop_db=False, config=config)
-    document = next(config_loader(config))
-    database: str = document.get("database", document["index"])
+    doc = next(config_loader(config))
+    database: str = doc.get("database", doc["index"])
     with pg_engine(database) as engine:
         Session = sessionmaker(bind=engine, autoflush=True)
         session = Session()
 
-        species = [
+        species: t.List[Specie] = [
             Specie(id=1, name="Protos"),
             Specie(id=2, name="Zerg"),
             Specie(id=3, name="Terran"),
@@ -31,7 +33,7 @@ def main(config):
         with subtransactions(session):
             session.add_all(species)
 
-        units = [
+        units: t.List[Unit] = [
             Unit(
                 name="Archon",
                 details="Created by merging two templar units, the archon is a powerful melee unit with a very durable force shield and a strong energy-based attack.",
@@ -81,7 +83,7 @@ def main(config):
         with subtransactions(session):
             session.add_all(units)
 
-        structures = [
+        structures: t.List[Structure] = [
             Structure(
                 name="Assimilator",
                 details="Allows probes to harvest vespene gas from geysers.",

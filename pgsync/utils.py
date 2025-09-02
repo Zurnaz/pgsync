@@ -1,21 +1,24 @@
 """PGSync utils."""
+
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
 import threading
+import typing as t
 from datetime import timedelta
 from string import Template
 from time import time
-from typing import Callable, Generator, Optional, Set
 from urllib.parse import ParseResult, urlparse
 
+import boto3
 import click
 import sqlalchemy as sa
 import sqlparse
 
-from .exc import SchemaError
-from .settings import CHECKPOINT_PATH, QUERY_LITERAL_BINDS, SCHEMA
+from . import settings
 from .urls import get_postgres_url, get_redis_url, get_search_url
 
 logger = logging.getLogger(__name__)
@@ -30,7 +33,7 @@ def chunks(value: list, size: int) -> list:
         yield value[i : i + size]
 
 
-def timeit(func: Callable):
+def timeit(func: t.Callable):
     def timed(*args, **kwargs):
         since: float = time()
         fn = func(*args, **kwargs)
@@ -42,7 +45,7 @@ def timeit(func: Callable):
 
 
 class Timer:
-    def __init__(self, message: Optional[str] = None):
+    def __init__(self, message: t.Optional[str] = None):
         self.message: str = message or ""
 
     def __enter__(self):
@@ -57,7 +60,7 @@ class Timer:
         )
 
 
-def threaded(func: Callable):
+def threaded(func: t.Callable):
     """Decorator for threaded code execution."""
 
     def wrapper(*args, **kwargs) -> threading.Thread:
@@ -70,16 +73,17 @@ def threaded(func: Callable):
     return wrapper
 
 
-def exception(func: Callable):
+def exception(func: t.Callable):
     """Decorator for threaded exception handling."""
 
-    def wrapper(*args, **kwargs) -> Callable:
+    def wrapper(*args, **kwargs) -> t.Callable:
         try:
             fn = func(*args, **kwargs)
         except Exception as e:
             name: str = threading.current_thread().name
+            err = e.args[0] if len(e.args) > 0 else e.args
             sys.stdout.write(
-                f"Exception in {func.__name__}() for thread {name}: {e}\n"
+                f"Exception in {func.__name__}() for thread {name}: {err}\n"
                 f"Exiting...\n"
             )
             os._exit(-1)
@@ -89,67 +93,148 @@ def exception(func: Callable):
     return wrapper
 
 
-def get_redacted_url(result: ParseResult) -> ParseResult:
-    if result.password:
-        username: Optional[str] = result.username
-        hostname: Optional[str] = result.hostname
-        if username and hostname:
-            result = result._replace(
-                netloc=f"{username}:{'*' * len(result.password)}@{hostname}"
-            )
-    return result
+def format_number(n: int) -> str:
+    """
+    Format a number with commas if the setting is enabled."""
+    return f"{n:,}" if settings.FORMAT_WITH_COMMAS else f"{n}"
 
 
-def show_settings(schema: Optional[str] = None) -> None:
+def get_redacted_url(url: str) -> str:
+    """
+    Returns a redacted version of the input URL, with the password replaced by asterisks.
+    """
+    parsed_url: ParseResult = urlparse(url)
+    if parsed_url.password:
+        username = parsed_url.username or ""
+        hostname = parsed_url.hostname or ""
+        port = f":{parsed_url.port}" if parsed_url.port else ""
+        redacted_password = "*" * len(parsed_url.password)
+        netloc: str = f"{username}:{redacted_password}@{hostname}{port}"
+        parsed_url = parsed_url._replace(netloc=netloc)
+    return parsed_url.geturl()
+
+
+def show_settings(
+    config: t.Optional[str] = None, s3_schema_url: t.Optional[str] = None
+) -> None:
     """Show settings."""
     logger.info(f"{HIGHLIGHT_BEGIN}Settings{HIGHLIGHT_END}")
-    logger.info(f'{"Schema":<10s}: {schema or SCHEMA}')
+    logger.info(f'{"Schema":<10s}: {config or s3_schema_url}')
     logger.info("-" * 65)
     logger.info(f"{HIGHLIGHT_BEGIN}Checkpoint{HIGHLIGHT_END}")
-    logger.info(f"Path: {CHECKPOINT_PATH}")
+    logger.info(f"Path: {settings.CHECKPOINT_PATH}")
     logger.info(f"{HIGHLIGHT_BEGIN}Postgres{HIGHLIGHT_END}")
-    result: ParseResult = get_redacted_url(
-        urlparse(get_postgres_url("postgres"))
-    )
-    logger.info(f"URL: {result.geturl()}")
-    result = get_redacted_url(urlparse(get_search_url()))
-    logger.info(f"{HIGHLIGHT_BEGIN}Search{HIGHLIGHT_END}")
-    logger.info(f"URL: {result.geturl()}")
+
+    url: str = get_postgres_url("postgres")
+    redacted_url: str = get_redacted_url(url)
+    logger.info(f"URL: {redacted_url}")
+
+    url: str = get_search_url()
+    redacted_url: str = get_redacted_url(url)
+    if settings.ELASTICSEARCH:
+        logger.info(f"{HIGHLIGHT_BEGIN}Elasticsearch{HIGHLIGHT_END}")
+    else:
+        logger.info(f"{HIGHLIGHT_BEGIN}OpenSearch{HIGHLIGHT_END}")
+    logger.info(f"URL: {redacted_url}")
     logger.info(f"{HIGHLIGHT_BEGIN}Redis{HIGHLIGHT_END}")
-    result = get_redacted_url(urlparse(get_redis_url()))
-    logger.info(f"URL: {result.geturl()}")
+
+    url: str = get_redis_url()
+    redacted_url: str = get_redacted_url(url)
+    logger.info(f"URL: {redacted_url}")
+    logger.info("-" * 65)
+
+    logger.info(f"{HIGHLIGHT_BEGIN}Replication slots{HIGHLIGHT_END}")
+    if config is not None and s3_schema_url is not None:
+        for doc in config_loader(config=config, s3_schema_url=s3_schema_url):
+            index: str = doc.get("index") or doc["database"]
+            database: str = doc.get("database", index)
+            slot_name: str = re.sub(
+                "[^0-9a-zA-Z_]+", "", f"{database.lower()}_{index}"
+            )
+        logger.info(f"Slot: {slot_name}")
+
     logger.info("-" * 65)
 
 
-def get_config(config: Optional[str] = None) -> str:
-    """Return the schema config for PGSync."""
-    config = config or SCHEMA
-    if not config:
-        raise SchemaError(
-            "Schema config not set\n. "
-            "Set env SCHEMA=/path/to/schema.json or "
-            "provide args --config /path/to/schema.json"
+def validate_config(
+    config: t.Optional[str] = None, s3_schema_url: t.Optional[str] = None
+) -> str:
+    """Ensure there is a valid schema config."""
+
+    if config:
+        if not os.path.exists(config):
+            raise FileNotFoundError(f'Schema config "{config}" not found')
+
+    if s3_schema_url:
+        if not s3_schema_url.startswith("s3://"):
+            raise ValueError(f'Invalid S3 URL: "{s3_schema_url}"')
+
+    if not config and not s3_schema_url:
+        raise ValueError(
+            "You must provide either a local config path or an S3 schema URL."
         )
-    if not os.path.exists(config):
-        raise FileNotFoundError(f'Schema config "{config}" not found')
-    return config
 
 
-def config_loader(config: str) -> Generator:
-    with open(config, "r") as documents:
-        for document in json.load(documents):
-            for key, value in document.items():
-                try:
-                    document[key] = Template(value).safe_substitute(os.environ)
-                except TypeError:
-                    pass
-            yield document
+def config_loader(
+    config: t.Optional[str] = None, s3_schema_url: t.Optional[str] = None
+) -> t.Generator[dict, None, None]:
+    """
+    Loads a configuration file from a local path or S3 URL and yields each document.
+    """
+
+    def is_s3_url(url: str) -> bool:
+        return url.lower().startswith("s3://")
+
+    def download_from_s3(s3_url: str) -> str:
+        parsed = urlparse(s3_url)
+        if not parsed.netloc or not parsed.path:
+            raise ValueError(f"Invalid S3 URL: {s3_url}")
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        s3 = boto3.client("s3")
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        s3.download_file(bucket, key, temp_file.name)
+        return temp_file.name
+
+    if not config and not s3_schema_url:
+        raise ValueError(
+            "You must provide either a local config path or an S3 URL."
+        )
+
+    config_path: str = None
+    is_temp_file: bool = False
+
+    if config:
+        if not os.path.exists(config):
+            raise FileNotFoundError(f'Local config "{config}" not found')
+        config_path = config
+    elif s3_schema_url and is_s3_url(s3_schema_url):
+        config_path = download_from_s3(s3_schema_url)
+        is_temp_file = True
+    else:
+        raise ValueError(
+            "Invalid input: schema must be a file path or a valid S3 URL"
+        )
+
+    try:
+        with open(config_path, "r") as f:
+            data = json.load(f)
+            for doc in data:
+                for key, value in doc.items():
+                    try:
+                        doc[key] = Template(value).safe_substitute(os.environ)
+                    except TypeError:
+                        pass
+                yield doc
+    finally:
+        if is_temp_file and os.path.exists(config_path):
+            os.remove(config_path)
 
 
 def compiled_query(
     query: sa.sql.Select,
-    label: Optional[str] = None,
-    literal_binds: bool = QUERY_LITERAL_BINDS,
+    label: t.Optional[str] = None,
+    literal_binds: bool = settings.QUERY_LITERAL_BINDS,
 ) -> None:
     """Compile an SQLAlchemy query with an optional label."""
     query = str(
@@ -170,8 +255,18 @@ def compiled_query(
 
 
 class MutuallyExclusiveOption(click.Option):
+    """
+    A custom Click option that allows for mutually exclusive arguments.
+
+    Args:
+        click.Option: The base class for Click options.
+
+    Attributes:
+        mutually_exclusive (set): A set of argument names that are mutually exclusive with this option.
+    """
+
     def __init__(self, *args, **kwargs):
-        self.mutually_exclusive: Set = set(
+        self.mutually_exclusive: t.Set = set(
             kwargs.pop("mutually_exclusive", [])
         )
         help: str = kwargs.get("help", "")
@@ -182,7 +277,23 @@ class MutuallyExclusiveOption(click.Option):
             )
         super(MutuallyExclusiveOption, self).__init__(*args, **kwargs)
 
-    def handle_parse_result(self, ctx, opts, args):
+    def handle_parse_result(
+        self,
+        ctx: click.Context,
+        opts: t.Mapping[str, t.Any],
+        args: t.List[str],
+    ) -> t.Tuple[t.Any, t.List[str]]:
+        """
+        Handles the parsing of the command-line arguments.
+
+        Args:
+            ctx (click.Context): The Click context.
+            opts (dict): The dictionary of parsed options.
+            args (list): The list of parsed arguments.
+
+        Returns:
+            The result of the base class's `handle_parse_result` method.
+        """
         if self.mutually_exclusive.intersection(opts) and self.name in opts:
             raise click.UsageError(
                 f"Illegal usage: `{self.name}` is mutually exclusive with "

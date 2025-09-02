@@ -1,4 +1,16 @@
-"""PGSync Constants."""
+"""
+PGSync Constants.
+
+This module contains constants used in PGSync.
+It includes constants for relationship types, relationship variants,
+node attributes, relationship attributes, relationship foreign keys,
+tg_op, JSONB operators, Elasticsearch types,
+Elasticsearch mapping parameters, transform types, default postgres schema,
+built-in schemas, primary key identifier, logical decoding output plugin,
+trigger function, materialized views, primary key delimiter,
+and replication slot patterns.
+"""
+
 import re
 
 # Relationship types
@@ -77,6 +89,7 @@ ELASTICSEARCH_TYPES = [
     "constant_keyword",
     "date",
     "date_range",
+    "dense_vector",
     "double",
     "double_range",
     "flattened",
@@ -195,5 +208,5 @@ LOGICAL_SLOT_PREFIX = re.compile(
     r"table\s\"?(?P<schema>[\w-]+)\"?.\"?(?P<table>[\w-]+)\"?:\s(?P<tg_op>[A-Z]+):"  # noqa E501
 )
 LOGICAL_SLOT_SUFFIX = re.compile(
-    '\s(?P<key>"?\w+"?)\[(?P<type>[\w\s]+)\]:(?P<value>[\w\'"\-]+)'
+    r'\s(?P<key>"?\w+"?)\[(?P<type>[\w\s]+)\]:(?P<value>(?:"[^"]*"|\'[^\']*\'|null|\d+e[+-]?\d+|\w+))'
 )

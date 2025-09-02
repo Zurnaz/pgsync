@@ -1,4 +1,5 @@
 """Constants tests."""
+
 from pgsync.constants import (
     ELASTICSEARCH_MAPPING_PARAMETERS,
     ELASTICSEARCH_TYPES,
@@ -98,6 +99,7 @@ class TestConstants(object):
                 "constant_keyword",
                 "date",
                 "double",
+                "dense_vector",
                 "float",
                 "geo_point",
                 "geo_shape",

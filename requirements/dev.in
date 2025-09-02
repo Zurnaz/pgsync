@@ -1,7 +1,13 @@
 -r base.in
--r test.in
 
+black
 coverage
-pip-tools
+faker
+flake8
+freezegun
+isort
+mock
 pre-commit
-setuptools
+pytest
+pytest-cov
+pytest-mock

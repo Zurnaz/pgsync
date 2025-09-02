@@ -1,13 +1,14 @@
 """PGSync helpers."""
+
 import logging
 import os
-from typing import Optional
+import typing as t
 
 import sqlalchemy as sa
 
 from .base import database_exists, drop_database
 from .sync import Sync
-from .utils import config_loader, get_config
+from .utils import config_loader, validate_config
 
 logger = logging.getLogger(__name__)
 
@@ -18,18 +19,30 @@ def teardown(
     delete_redis: bool = True,
     drop_index: bool = True,
     delete_checkpoint: bool = True,
-    config: Optional[str] = None,
+    config: t.Optional[str] = None,
+    s3_schema_url: t.Optional[str] = None,
     validate: bool = False,
 ) -> None:
-    """Teardown helper."""
-    config: str = get_config(config)
+    """
+    Teardown helper.
 
-    for document in config_loader(config):
-        if not database_exists(document["database"]):
-            logger.warning(f'Database {document["database"]} does not exist')
+    Args:
+        drop_db (bool, optional): Whether to drop the database. Defaults to True.
+        truncate_db (bool, optional): Whether to truncate the database. Defaults to True.
+        delete_redis (bool, optional): Whether to delete Redis/Valkey. Defaults to True.
+        drop_index (bool, optional): Whether to drop the index. Defaults to True.
+        delete_checkpoint (bool, optional): Whether to delete the checkpoint. Defaults to True.
+        config (Optional[str], optional): The configuration file path. Defaults to None.
+        validate (bool, optional): Whether to validate the configuration. Defaults to False.
+    """
+    validate_config(config=config, s3_schema_url=s3_schema_url)
+
+    for doc in config_loader(config=config, s3_schema_url=s3_schema_url):
+        if not database_exists(doc["database"]):
+            logger.warning(f'Database {doc["database"]} does not exist')
             continue
 
-        sync: Sync = Sync(document, validate=validate)
+        sync: Sync = Sync(doc, validate=validate)
         if truncate_db:
             try:
                 sync.truncate_schemas()

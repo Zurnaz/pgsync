@@ -6,9 +6,19 @@ import logging
 import click
 from elasticsearch import Elasticsearch, helpers
 
-from pgsync.settings import ELASTICSEARCH_TIMEOUT, ELASTICSEARCH_VERIFY_CERTS
-from pgsync.urls import get_elasticsearch_url
-from pgsync.utils import config_loader, get_config, timeit
+from pgsync.settings import (
+    ELASTICSEARCH_TIMEOUT,
+    ELASTICSEARCH_VERIFY_CERTS,
+    S3_SCHEMA_URL,
+    SCHEMA,
+)
+from pgsync.urls import get_search_url
+from pgsync.utils import (
+    config_loader,
+    MutuallyExclusiveOption,
+    timeit,
+    validate_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +63,7 @@ def apply_analyzer_to_mapping(mapping: dict, analyzer: dict) -> dict:
 
 
 def get_configuration(es, index: str) -> dict:
-    configuration: dict = es.indices.get_settings(index)[index]
+    configuration: dict = es.indices.get_settings(index=index)[index]
     # skip these attributes
     for key in [
         "uuid",
@@ -62,7 +72,7 @@ def get_configuration(es, index: str) -> dict:
         "creation_date",
     ]:
         configuration["settings"]["index"].pop(key)
-    mapping: dict = es.indices.get_mapping(index)
+    mapping: dict = es.indices.get_mapping(index=index)
     analyzer_mapping: dict = apply_analyzer_to_mapping(
         mapping,
         {
@@ -80,10 +90,10 @@ def get_configuration(es, index: str) -> dict:
 @timeit
 def create_es_mapping(index: str) -> None:
     logger.debug(f"Create Elasticsearch mapping for index {index}")
-    url: str = get_elasticsearch_url()
+    url: str = get_search_url()
     es: Elasticsearch = Elasticsearch(
         hosts=[url],
-        timeout=ELASTICSEARCH_TIMEOUT,
+        request_timeout=ELASTICSEARCH_TIMEOUT,
         verify_certs=ELASTICSEARCH_VERIFY_CERTS,
     )
 
@@ -109,13 +119,31 @@ def create_es_mapping(index: str) -> None:
     "-c",
     help="Schema config",
     type=click.Path(exists=True),
+    default=SCHEMA,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["s3_schema_url"],
 )
-def main(config):
+@click.option(
+    "--s3_schema_url",
+    help="S3 URL for schema config",
+    type=click.STRING,
+    default=S3_SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config"],
+)
+def main(config: str, s3_schema_url: str) -> None:
     """Create custom NGram analyzer for the default mapping."""
 
-    config: str = get_config(config)
+    validate_config(config=config, s3_schema_url=s3_schema_url)
     for index in set(
-        [document["index"] for document in config_loader(config)]
+        [
+            doc["index"]
+            for doc in config_loader(
+                config=config, s3_schema_url=s3_schema_url
+            )
+        ]
     ):
         create_es_mapping(index)
 

@@ -1,11 +1,12 @@
+import typing as t
+
 import click
-import sqlalchemy as sa
 from schema import Comment, Post, PostComment, Tag, User, UserPost, UserTag
 from sqlalchemy.orm import sessionmaker
 
 from pgsync.base import pg_engine, subtransactions
 from pgsync.helper import teardown
-from pgsync.utils import config_loader, get_config
+from pgsync.utils import config_loader, validate_config
 
 
 @click.command()
@@ -15,17 +16,17 @@ from pgsync.utils import config_loader, get_config
     help="Schema config",
     type=click.Path(exists=True),
 )
-def main(config):
-    config: str = get_config(config)
+def main(config: str) -> None:
+    validate_config(config)
     teardown(drop_db=False, config=config)
-    document: dict = next(config_loader(config))
-    database: str = document.get("database", document["index"])
+    doc: dict = next(config_loader(config))
+    database: str = doc.get("database", doc["index"])
     with pg_engine(database) as engine:
         Session = sessionmaker(bind=engine, autoflush=True)
         session = Session()
 
         # Bootstrap
-        users = [
+        users: t.List[User] = [
             User(name="Carla Ferreira Cardoso", age=19, gender="female"),
             User(name="Uwe Fuerst", age=58, gender="male"),
             User(name="Otitodilinna Chigolum", age=36, gender="male"),
@@ -33,7 +34,7 @@ def main(config):
         with subtransactions(session):
             session.add_all(users)
 
-        posts = [
+        posts: t.List[Post] = [
             Post(slug="post_1", title="This is the first post"),
             Post(slug="post_2", title="This is the second post"),
             Post(slug="post_3", title="This is the third post"),
@@ -41,7 +42,7 @@ def main(config):
         with subtransactions(session):
             session.add_all(posts)
 
-        comments = [
+        comments: t.List[Comment] = [
             Comment(
                 title="Comment 1",
                 content="This is a sample comment for comment 1",
@@ -70,7 +71,7 @@ def main(config):
         with subtransactions(session):
             session.add_all(comments)
 
-        tags = [
+        tags: t.List[Tag] = [
             Tag(name="Economics"),
             Tag(name="Career"),
             Tag(name="Political"),
@@ -87,7 +88,7 @@ def main(config):
         with subtransactions(session):
             session.add_all(tags)
 
-        user_posts = [
+        user_posts: t.List[UserPost] = [
             UserPost(
                 user=users[0],
                 post=posts[0],
@@ -104,7 +105,7 @@ def main(config):
         with subtransactions(session):
             session.add_all(user_posts)
 
-        user_tags = [
+        user_tags: t.List[UserTag] = [
             UserTag(
                 user=users[0],
                 tag=tags[0],
@@ -141,7 +142,7 @@ def main(config):
         with subtransactions(session):
             session.add_all(user_tags)
 
-        post_comments = [
+        post_comments: t.List[PostComment] = [
             PostComment(
                 post=posts[0],
                 comment=comments[0],
