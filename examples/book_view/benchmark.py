@@ -1,5 +1,5 @@
+import typing as t
 from random import choice
-from typing import Set
 
 import click
 import sqlalchemy as sa
@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from pgsync.base import pg_engine
 from pgsync.constants import DELETE, INSERT, TG_OP, UPDATE
-from pgsync.utils import config_loader, get_config, show_settings, Timer
+from pgsync.utils import config_loader, show_settings, Timer, validate_config
 
 FIELDS = {
     "isbn": "isbn13",
@@ -21,7 +21,7 @@ FIELDS = {
 
 def insert_op(session: sessionmaker, model, nsize: int) -> None:
     faker: Faker = Faker()
-    rows: Set = set()
+    rows: t.Set = set()
     for _ in range(nsize):
         kwargs = {}
         for column in model.__table__.columns:
@@ -128,11 +128,11 @@ def delete_op(session: sessionmaker, model, nsize: int) -> None:
     ),
 )
 def main(config, nsize, daemon, tg_op):
-    show_settings()
+    show_settings(config)
 
-    config: str = get_config(config)
-    document: dict = next(config_loader(config))
-    database: str = document.get("database", document["index"])
+    validate_config(config)
+    doc: dict = next(config_loader(config))
+    database: str = doc.get("database", doc["index"])
     with pg_engine(database) as engine:
         Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
         session = Session()

@@ -1,4 +1,5 @@
 """Utils tests."""
+
 import os
 from urllib.parse import ParseResult, urlparse
 
@@ -14,12 +15,12 @@ from pgsync.utils import (
     compiled_query,
     config_loader,
     exception,
-    get_config,
     get_redacted_url,
     show_settings,
     threaded,
     timeit,
     Timer,
+    validate_config,
 )
 
 
@@ -27,21 +28,46 @@ from pgsync.utils import (
 class TestUtils(object):
     """Utils tests."""
 
-    def test_get_config(self):
-        with pytest.raises(SchemaError) as excinfo:
-            get_config()
-        assert "Schema config not set" in str(excinfo.value)
+    def test_validate_config(self):
+        # Test: neither config nor s3_schema_url provided
+        with pytest.raises(ValueError) as excinfo:
+            validate_config()
+        assert (
+            "You must provide either a local config path or an S3 schema URL."
+            in str(excinfo.value)
+        )
 
+        # Test: non-existent local config file
         with pytest.raises(FileNotFoundError) as excinfo:
-            get_config("non_existent")
-        assert 'Schema config "non_existent" not found' in str(excinfo.value)
-        config: str = get_config("tests/fixtures/schema.json")
-        assert config == "tests/fixtures/schema.json"
+            validate_config(config="non_existent.json")
+        assert 'Schema config "non_existent.json" not found' in str(
+            excinfo.value
+        )
+
+        # Test: invalid S3 URL
+        with pytest.raises(ValueError) as excinfo:
+            validate_config(s3_schema_url="http://example.com/schema.json")
+        assert 'Invalid S3 URL: "http://example.com/schema.json"' in str(
+            excinfo.value
+        )
+
+        # Test: valid local config file (assumes it exists)
+        test_config_path = "tests/fixtures/schema.json"
+        assert os.path.exists(
+            test_config_path
+        ), f"Test file missing: {test_config_path}"
+        # Should not raise an error
+        validate_config(config=test_config_path)
+
+        # Test: valid S3 URL
+        validate_config(
+            s3_schema_url="s3://bucket/schema.json"
+        )  # Should not raise
 
     def test_config_loader(self):
         os.environ["foo"] = "mydb"
         os.environ["bar"] = "myindex"
-        config: str = get_config("tests/fixtures/schema.json")
+        config: str = "tests/fixtures/schema.json"
         data = config_loader(config)
         assert next(data) == {
             "database": "fakedb",
@@ -62,7 +88,7 @@ class TestUtils(object):
 
     @patch("pgsync.utils.logger")
     def test_show_settings(self, mock_logger):
-        show_settings(schema="tests/fixtures/schema.json")
+        show_settings(config="tests/fixtures/schema.json")
         calls = [
             call("\x1b[4mSettings\x1b[0m:"),
             call("Schema    : tests/fixtures/schema.json"),
@@ -70,7 +96,7 @@ class TestUtils(object):
             call("Path: ./"),
             call("\x1b[4mPostgres\x1b[0m:"),
             call("URL: {get_postgres_url}"),
-            call("\x1b[4mSearch\x1b[0m:"),
+            call("\x1b[4mElasticsearch\x1b[0m:"),
             call(f"URL: {get_search_url()}"),
             call("\x1b[4mRedis\x1b[0m:"),
             call(f"URL: {get_redis_url}"),
@@ -122,7 +148,7 @@ class TestUtils(object):
     ):
         pg_base = Base(connection.engine.url.database)
         model = pg_base.models("book", "public")
-        statement = sa.select([model.c.isbn]).select_from(model)
+        statement = sa.select(*[model.c.isbn]).select_from(model)
         compiled_query(statement, label="foo", literal_binds=True)
         mock_logger.debug.assert_called_once_with(
             "\x1b[4mfoo:\x1b[0m\nSELECT book_1.isbn\n"
@@ -137,7 +163,7 @@ class TestUtils(object):
     ):
         pg_base = Base(connection.engine.url.database)
         model = pg_base.models("book", "public")
-        statement = sa.select([model.c.isbn]).select_from(model)
+        statement = sa.select(*[model.c.isbn]).select_from(model)
         compiled_query(statement, literal_binds=True)
         mock_logger.debug.assert_called_once_with(
             "SELECT book_1.isbn\nFROM public.book AS book_1"
@@ -145,24 +171,10 @@ class TestUtils(object):
         assert mock_sys.stdout.write.call_count == 3
 
     def test_get_redacted_url(self):
-        result: ParseResult = get_redacted_url(
-            urlparse(get_postgres_url("postgres"))
+        url: str = get_redacted_url(
+            get_postgres_url("postgres", user="root", password="bar")
         )
-        assert result.scheme == "postgresql+psycopg2"
-        assert result.path == "/postgres"
-        assert result.params == ""
-        assert result.query == ""
-        assert result.fragment == ""
-
-        result: ParseResult = get_redacted_url(
-            urlparse(get_postgres_url("postgres", user="root", password="bar"))
-        )
-        assert result.scheme == "postgresql+psycopg2"
-        assert result.path == "/postgres"
-        assert result.netloc == "root:***@localhost"
-        assert result.params == ""
-        assert result.query == ""
-        assert result.fragment == ""
+        assert url == "postgresql+psycopg2://root:***@localhost:5432/postgres"
 
     def test_threaded(self):
         @threaded
@@ -189,7 +201,7 @@ class TestUtils(object):
         with patch("pgsync.utils.os._exit", return_value=None):
             foo(1)
             mock_sys.stdout.write.assert_called_once_with(
-                "Exception in foo() for thread MainThread: \nExiting...\n"
+                "Exception in foo() for thread MainThread: ()\nExiting...\n"
             )
 
         bar(1)

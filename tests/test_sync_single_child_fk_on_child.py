@@ -4,7 +4,6 @@ import mock
 import psycopg2
 import pytest
 
-from pgsync import settings
 from pgsync.base import subtransactions
 from pgsync.exc import (
     ForeignKeyError,
@@ -113,12 +112,11 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert docs[0]["_id"] == "abc"
         assert docs[0]["_source"] == {
-            "_meta": {"rating": {"id": [1]}},
+            "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
             "description": "Tigers are fierce creatures",
             "isbn": "abc",
             "rating": {"id": 1, "value": 1.1},
@@ -127,7 +125,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[1]["_id"] == "def"
         assert docs[1]["_source"] == {
-            "_meta": {"rating": {"id": [2]}},
+            "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
             "description": "Lion and the mouse",
             "isbn": "def",
             "rating": {"id": 2, "value": 2.2},
@@ -136,7 +134,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[2]["_id"] == "ghi"
         assert docs[2]["_source"] == {
-            "_meta": {"rating": {"id": [3]}},
+            "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
             "description": "Rabbits on the run",
             "isbn": "ghi",
             "rating": {"id": 3, "value": 3.3},
@@ -159,14 +157,13 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         docs = sorted(docs, key=lambda k: k["_id"])
 
         assert docs[0]["_id"] == "abc"
         assert docs[0]["_source"] == {
-            "_meta": {"rating": {"id": [1]}},
+            "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
             "description": "Tigers are fierce creatures",
             "isbn": "abc",
             "rating": [{"id": 1, "value": 1.1}],
@@ -175,7 +172,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[1]["_id"] == "def"
         assert docs[1]["_source"] == {
-            "_meta": {"rating": {"id": [2]}},
+            "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
             "description": "Lion and the mouse",
             "isbn": "def",
             "rating": [{"id": 2, "value": 2.2}],
@@ -184,7 +181,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[2]["_id"] == "ghi"
         assert docs[2]["_source"] == {
-            "_meta": {"rating": {"id": [3]}},
+            "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
             "description": "Rabbits on the run",
             "isbn": "ghi",
             "rating": [{"id": 3, "value": 3.3}],
@@ -207,12 +204,11 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert docs[0]["_id"] == "abc"
         assert docs[0]["_source"] == {
-            "_meta": {"rating": {"id": [1]}},
+            "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
             "description": "Tigers are fierce creatures",
             "isbn": "abc",
             "rating": 1.1,
@@ -221,7 +217,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[1]["_id"] == "def"
         assert docs[1]["_source"] == {
-            "_meta": {"rating": {"id": [2]}},
+            "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
             "description": "Lion and the mouse",
             "isbn": "def",
             "rating": 2.2,
@@ -230,7 +226,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[2]["_id"] == "ghi"
         assert docs[2]["_source"] == {
-            "_meta": {"rating": {"id": [3]}},
+            "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
             "description": "Rabbits on the run",
             "isbn": "ghi",
             "rating": 3.3,
@@ -253,13 +249,12 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         docs = sorted(docs, key=lambda k: k["_id"])
         assert docs[0]["_id"] == "abc"
         assert docs[0]["_source"] == {
-            "_meta": {"rating": {"id": [1]}},
+            "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
             "description": "Tigers are fierce creatures",
             "isbn": "abc",
             "rating": [1.1],
@@ -268,7 +263,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[1]["_id"] == "def"
         assert docs[1]["_source"] == {
-            "_meta": {"rating": {"id": [2]}},
+            "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
             "description": "Lion and the mouse",
             "isbn": "def",
             "rating": [2.2],
@@ -277,7 +272,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[2]["_id"] == "ghi"
         assert docs[2]["_source"] == {
-            "_meta": {"rating": {"id": [3]}},
+            "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
             "description": "Rabbits on the run",
             "isbn": "ghi",
             "rating": [3.3],
@@ -301,12 +296,11 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert docs[0]["_id"] == "abc"
         assert docs[0]["_source"] == {
-            "_meta": {"rating": {"id": [1]}},
+            "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
             "description": "Tigers are fierce creatures",
             "isbn": "abc",
             "rating_x": 1.1,
@@ -315,7 +309,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[1]["_id"] == "def"
         assert docs[1]["_source"] == {
-            "_meta": {"rating": {"id": [2]}},
+            "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
             "description": "Lion and the mouse",
             "isbn": "def",
             "rating_x": 2.2,
@@ -324,7 +318,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[2]["_id"] == "ghi"
         assert docs[2]["_source"] == {
-            "_meta": {"rating": {"id": [3]}},
+            "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
             "description": "Rabbits on the run",
             "isbn": "ghi",
             "rating_x": 3.3,
@@ -349,12 +343,11 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert docs[0]["_id"] == "abc"
         assert docs[0]["_source"] == {
-            "_meta": {"rating": {"id": [1]}},
+            "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
             "description": "Tigers are fierce creatures",
             "isbn": "abc",
             "rating": 1.1,
@@ -384,13 +377,12 @@ class TestParentSingleChildFkOnChild(object):
             ],
         }
         sync.nodes = nodes
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert docs[0]["_id"] == "abc"
 
         assert docs[0]["_source"] == {
-            "_meta": {"rating": {"id": [1]}},
+            "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
             "book_isbn": "abc",
             "book_title": "The Tiger Club",
             "description": "Tigers are fierce creatures",
@@ -398,7 +390,7 @@ class TestParentSingleChildFkOnChild(object):
         }
         assert docs[1]["_id"] == "def"
         assert docs[1]["_source"] == {
-            "_meta": {"rating": {"id": [2]}},
+            "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
             "book_isbn": "def",
             "book_title": "The Lion Club",
             "description": "Lion and the mouse",
@@ -407,7 +399,7 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs[2]["_id"] == "ghi"
         assert docs[2]["_source"] == {
-            "_meta": {"rating": {"id": [3]}},
+            "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
             "book_isbn": "ghi",
             "book_title": "The Rabbit Club",
             "description": "Rabbits on the run",
@@ -430,8 +422,7 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
 
         fields = ["_meta", "description", "isbn", "rating", "title"]
@@ -458,11 +449,10 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert docs[2]["_source"] == {
-            "_meta": {"rating": {"id": [3]}},
+            "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
             "copyright": None,
             "description": "Rabbits on the run",
             "isbn": "ghi",
@@ -487,7 +477,7 @@ class TestParentSingleChildFkOnChild(object):
         }
         sync.search_client.close()
         with pytest.raises(RelationshipTypeError) as excinfo:
-            Tree(sync.models).build(nodes)
+            Tree(sync.models, nodes)
         assert 'Relationship type "qwerty" is invalid' in str(excinfo.value)
 
     def test_invalid_relationship_variant(self, sync):
@@ -505,7 +495,7 @@ class TestParentSingleChildFkOnChild(object):
         }
         sync.search_client.close()
         with pytest.raises(RelationshipVariantError) as excinfo:
-            Tree(sync.models).build(nodes)
+            Tree(sync.models, nodes)
         assert 'Relationship variant "abcdefg" is invalid' in str(
             excinfo.value
         )
@@ -522,7 +512,7 @@ class TestParentSingleChildFkOnChild(object):
         }
         sync.search_client.close()
         with pytest.raises(RelationshipAttributeError) as excinfo:
-            Tree(sync.models).build(nodes)
+            Tree(sync.models, nodes)
         assert f"Relationship attribute {set(['foo'])} is invalid" in str(
             excinfo.value
         )
@@ -541,13 +531,21 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         docs = [sort_list(doc) for doc in sync.sync()]
         sources = {doc["_id"]: doc["_source"] for doc in docs}
-        assert sources["abc"]["_meta"] == {"rating": {"id": [1]}}
-        assert sources["def"]["_meta"] == {"rating": {"id": [2]}}
-        assert sources["ghi"]["_meta"] == {"rating": {"id": [3]}}
+        assert sources["abc"]["_meta"] == {
+            "book": {"isbn": ["abc"]},
+            "rating": {"id": [1]},
+        }
+        assert sources["def"]["_meta"] == {
+            "book": {"isbn": ["def"]},
+            "rating": {"id": [2]},
+        }
+        assert sources["ghi"]["_meta"] == {
+            "book": {"isbn": ["ghi"]},
+            "rating": {"id": [3]},
+        }
         assert_resync_empty(sync, nodes)
 
     def test_missing_foreign_keys(self, sync, data):
@@ -564,8 +562,7 @@ class TestParentSingleChildFkOnChild(object):
                 }
             ],
         }
-        sync.tree.__post_init__()
-        sync.root = sync.tree.build(nodes)
+        sync.tree = Tree(sync.models, nodes)
         with pytest.raises(ForeignKeyError) as excinfo:
             [sort_list(doc) for doc in sync.sync()]
         msg = (
@@ -588,7 +585,7 @@ class TestParentSingleChildFkOnChild(object):
         self, data, book_cls, rating_cls, engine
     ):
         """Test sync updates primary_key then sync in non-concurrent mode."""
-        document = {
+        doc = {
             "index": "testdb",
             "database": "testdb",
             "nodes": {
@@ -606,7 +603,7 @@ class TestParentSingleChildFkOnChild(object):
                 ],
             },
         }
-        sync = Sync(document)
+        sync = Sync(doc)
         sync.search_client.bulk(sync.index, sync.sync())
         sync.search_client.refresh("testdb")
 
@@ -614,19 +611,19 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "The Rabbit Club",
@@ -656,38 +653,38 @@ class TestParentSingleChildFkOnChild(object):
         docs = search(sync.search_client, "testdb")
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {},
+                "_meta": {"book": {"isbn": ["ghi"]}},
                 "isbn": "ghi",
                 "rating": None,
                 "title": "The Rabbit Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["xyz"]}, "rating": {"id": [3]}},
                 "isbn": "xyz",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "Milli and the Ants",
             },
         ]
-        assert_resync_empty(sync, document.get("node", {}))
+        assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
 
     # TODO: Add another test like this and change
     # both primary key and non pkey column
     def test_update_primary_key_concurrent(self, data, book_cls, rating_cls):
         """Test sync updates primary_key and then sync in concurrent mode."""
-        document = {
+        doc = {
             "index": "testdb",
             "database": "testdb",
             "nodes": {
@@ -705,26 +702,26 @@ class TestParentSingleChildFkOnChild(object):
                 ],
             },
         }
-        sync = Sync(document)
+        sync = Sync(doc)
         sync.search_client.bulk(sync.index, sync.sync())
         sync.search_client.refresh("testdb")
         docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "The Rabbit Club",
@@ -770,42 +767,42 @@ class TestParentSingleChildFkOnChild(object):
                             "pgsync.sync.Sync.status",
                             side_effect=noop,
                         ):
-                            sync.receive(settings.NTHREADS_POLLDB)
+                            sync.receive()
                             sync.search_client.refresh("testdb")
 
         docs = search(sync.search_client, "testdb")
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {},
+                "_meta": {"book": {"isbn": ["ghi"]}},
                 "isbn": "ghi",
                 "rating": None,
                 "title": "The Rabbit Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["xyz"]}, "rating": {"id": [3]}},
                 "isbn": "xyz",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "Milli and the Ants",
             },
         ]
-        assert_resync_empty(sync, document.get("node", {}))
+        assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
 
     def test_insert_non_concurrent(self, data, book_cls, rating_cls):
         """Test sync insert and then sync in non-concurrent mode."""
-        document = {
+        doc = {
             "index": "testdb",
             "database": "testdb",
             "nodes": {
@@ -823,7 +820,7 @@ class TestParentSingleChildFkOnChild(object):
                 ],
             },
         }
-        sync = Sync(document)
+        sync = Sync(doc)
         sync.search_client.bulk(sync.index, sync.sync())
         sync.search_client.refresh("testdb")
 
@@ -832,19 +829,19 @@ class TestParentSingleChildFkOnChild(object):
         docs = search(sync.search_client, "testdb")
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "The Rabbit Club",
@@ -877,38 +874,38 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "The Rabbit Club",
             },
             {
-                "_meta": {"rating": {"id": [99]}},
+                "_meta": {"book": {"isbn": ["xyz"]}, "rating": {"id": [99]}},
                 "isbn": "xyz",
                 "rating": {"id": 99, "value": 4.4},
                 "title": "Encyclopedia",
             },
         ]
-        assert_resync_empty(sync, document.get("node", {}))
+        assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
 
     def test_update_non_primary_key_non_concurrent(
         self, data, book_cls, rating_cls
     ):
         """Test sync update and then sync in non-concurrent mode."""
-        document = {
+        doc = {
             "index": "testdb",
             "database": "testdb",
             "nodes": {
@@ -926,7 +923,7 @@ class TestParentSingleChildFkOnChild(object):
                 ],
             },
         }
-        sync = Sync(document)
+        sync = Sync(doc)
         sync.search_client.bulk(sync.index, sync.sync())
         sync.search_client.refresh("testdb")
 
@@ -934,19 +931,19 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "The Rabbit Club",
@@ -973,32 +970,32 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 4.4},
                 "title": "The Rabbit Club",
             },
         ]
-        assert_resync_empty(sync, document.get("node", {}))
+        assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
 
     def test_update_non_primary_key_concurrent(
         self, data, book_cls, rating_cls
     ):
         """Test sync update and then sync in concurrent mode."""
-        document = {
+        doc = {
             "index": "testdb",
             "database": "testdb",
             "nodes": {
@@ -1016,7 +1013,7 @@ class TestParentSingleChildFkOnChild(object):
                 ],
             },
         }
-        sync = Sync(document)
+        sync = Sync(doc)
         sync.search_client.bulk(sync.index, sync.sync())
         sync.search_client.refresh("testdb")
 
@@ -1024,19 +1021,19 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "The Rabbit Club",
@@ -1073,37 +1070,37 @@ class TestParentSingleChildFkOnChild(object):
                             "pgsync.sync.Sync.status",
                             side_effect=noop,
                         ):
-                            sync.receive(settings.NTHREADS_POLLDB)
+                            sync.receive()
                             sync.search_client.refresh("testdb")
 
         docs = search(sync.search_client, "testdb")
 
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 4.4},
                 "title": "The Rabbit Club",
             },
         ]
-        assert_resync_empty(sync, document.get("node", {}))
+        assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
 
     def test_delete_concurrent(self, data, book_cls, rating_cls):
         """Test sync delete and then sync in concurrent mode."""
-        document = {
+        doc = {
             "index": "testdb",
             "database": "testdb",
             "nodes": {
@@ -1122,7 +1119,7 @@ class TestParentSingleChildFkOnChild(object):
             },
         }
 
-        sync = Sync(document)
+        sync = Sync(doc)
         sync.search_client.bulk(sync.index, sync.sync())
         sync.search_client.refresh("testdb")
 
@@ -1130,19 +1127,19 @@ class TestParentSingleChildFkOnChild(object):
 
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["ghi"]}, "rating": {"id": [3]}},
                 "isbn": "ghi",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "The Rabbit Club",
@@ -1193,29 +1190,29 @@ class TestParentSingleChildFkOnChild(object):
                             "pgsync.sync.Sync.status",
                             side_effect=noop,
                         ):
-                            sync.receive(settings.NTHREADS_POLLDB)
+                            sync.receive()
                             sync.search_client.refresh("testdb")
 
         docs = search(sync.search_client, "testdb")
         assert docs == [
             {
-                "_meta": {"rating": {"id": [1]}},
+                "_meta": {"book": {"isbn": ["abc"]}, "rating": {"id": [1]}},
                 "isbn": "abc",
                 "rating": {"id": 1, "value": 1.1},
                 "title": "The Tiger Club",
             },
             {
-                "_meta": {"rating": {"id": [2]}},
+                "_meta": {"book": {"isbn": ["def"]}, "rating": {"id": [2]}},
                 "isbn": "def",
                 "rating": {"id": 2, "value": 2.2},
                 "title": "The Lion Club",
             },
             {
-                "_meta": {"rating": {"id": [3]}},
+                "_meta": {"book": {"isbn": ["xyz"]}, "rating": {"id": [3]}},
                 "isbn": "xyz",
                 "rating": {"id": 3, "value": 3.3},
                 "title": "The End of time",
             },
         ]
-        assert_resync_empty(sync, document.get("node", {}))
+        assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
