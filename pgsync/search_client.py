@@ -19,13 +19,14 @@ from .constants import (
     META,
 )
 from .node import Tree
+from .sink import Sink
 from .urls import get_search_url
 
 logger = logging.getLogger(__name__)
 
 
-class SearchClient(object):
-    """SearchClient."""
+class SearchClient(Sink):
+    """Elasticsearch/OpenSearch sink — the reference :class:`Sink`."""
 
     def __init__(self):
         """
@@ -83,6 +84,17 @@ class SearchClient(object):
     def close(self) -> None:
         """Close transport connection."""
         self.__client.transport.close()
+
+    def prepare_action(self, doc: dict) -> dict:
+        """Add the legacy ``_type`` field for Elasticsearch < 7.
+
+        Overrides :meth:`pgsync.sink.Sink.prepare_action` so this ES-only quirk
+        stays behind the sink instead of in ``Sync``. OpenSearch and ES >= 7 need
+        no ``_type``, so the doc is returned unchanged there.
+        """
+        if self.major_version < 7 and not self.is_opensearch:
+            doc["_type"] = "_doc"
+        return doc
 
     def teardown(self, index: str) -> None:
         """
@@ -215,6 +227,21 @@ class SearchClient(object):
         """Refresh the Elasticsearch/OpenSearch index."""
         self.__client.indices.refresh(index=indices)
 
+    def delete_by_query(self, index: str, ids: t.List[str]) -> None:
+        """Delete documents by id across all shards.
+
+        This is used for the rare primary-key update where a document was
+        indexed with custom routing but its old routing value is absent from
+        the CDC payload.
+        """
+        if not ids:
+            return
+        self.__client.delete_by_query(
+            index=index,
+            body={"query": {"ids": {"values": ids}}},
+            conflicts="proceed",
+        )
+
     def _search(self, index: str, table: str, fields: t.Optional[dict] = None):
         """
         Search private area for matching docs in Elasticsearch/OpenSearch.
@@ -226,7 +253,7 @@ class SearchClient(object):
             'uid': ['a002', 'a009'],
         }
         """
-        fields = fields or {}
+        fields: dict = fields or {}
         search = self.Search(using=self.__client, index=index)
         # explicitly exclude all fields since we only need the doc _id
         search = search.source(excludes=["*"])
@@ -391,6 +418,7 @@ def get_search_client(
                 verify_certs=True,
                 connection_class=connection_class,
                 timeout=settings.ELASTICSEARCH_TIMEOUT,
+                pool_maxsize=settings.ELASTICSEARCH_POOL_MAXSIZE,
             )
         elif settings.ELASTICSEARCH:
             return client(
@@ -405,6 +433,7 @@ def get_search_client(
                 verify_certs=True,
                 node_class=node_class,
                 timeout=settings.ELASTICSEARCH_TIMEOUT,
+                connections_per_node=settings.ELASTICSEARCH_POOL_MAXSIZE,
             )
     else:
         hosts: t.List[str] = [url]
@@ -440,6 +469,7 @@ def get_search_client(
         ssl_version: t.Optional[int] = settings.ELASTICSEARCH_SSL_VERSION
         ssl_context: t.Optional[t.Any] = settings.ELASTICSEARCH_SSL_CONTEXT
         ssl_show_warn: bool = settings.ELASTICSEARCH_SSL_SHOW_WARN
+        pool_maxsize: int = settings.ELASTICSEARCH_POOL_MAXSIZE
         return client(
             hosts=hosts,
             http_auth=http_auth,
@@ -459,4 +489,9 @@ def get_search_client(
             ssl_context=ssl_context,
             ssl_show_warn=ssl_show_warn,
             timeout=settings.ELASTICSEARCH_TIMEOUT,
+            **(
+                {"connections_per_node": pool_maxsize}
+                if settings.ELASTICSEARCH
+                else {"pool_maxsize": pool_maxsize}
+            ),
         )

@@ -2,8 +2,9 @@
 
 import logging
 import typing as t
-from urllib.parse import quote_plus
+from urllib.parse import ParseResult, quote, quote_plus, urlparse, urlunparse
 
+from . import settings
 from .plugin import Plugins
 from .settings import (
     ELASTICSEARCH_HOST,
@@ -17,7 +18,6 @@ from .settings import (
     PG_PASSWORD,
     PG_PORT,
     PG_URL,
-    PG_USER,
     REDIS_AUTH,
     REDIS_DB,
     REDIS_HOST,
@@ -25,9 +25,19 @@ from .settings import (
     REDIS_SCHEME,
     REDIS_URL,
     REDIS_USER,
+    USE_UTF8MB4,
 )
 
+# PG_USER is resolved lazily (see pgsync.settings.__getattr__); referencing it
+# via the module — settings.PG_USER — rather than a name-import keeps `import
+# pgsync` env-free.
+
 logger = logging.getLogger(__name__)
+
+DIALECT = {
+    "psycopg2": "postgresql",
+    "pymysql": "mysql",
+}
 
 
 def _get_auth(key: str) -> t.Optional[str]:
@@ -89,7 +99,7 @@ def get_search_url(
     return f"{scheme}://{auth}{host}:{port}"
 
 
-def get_postgres_url(
+def get_database_url(
     database: str,
     user: t.Optional[str] = None,
     host: t.Optional[str] = None,
@@ -98,7 +108,7 @@ def get_postgres_url(
     driver: t.Optional[str] = None,
 ) -> str:
     """
-    Return the URL to connect to Postgres.
+    Return the URL to connect to the database.
 
     Args:
         database (str): The name of the database to connect to.
@@ -109,22 +119,44 @@ def get_postgres_url(
         driver (str, optional): The name of the driver to use for the connection. Defaults to None.
 
     Returns:
-        str: The URL to connect to the Postgres database.
+        str: The URL to connect to the database.
     """
-    user = user or PG_USER
+    user = user or settings.PG_USER
     host = host or PG_HOST
     password = _get_auth("PG_PASSWORD") or password or PG_PASSWORD
     port = port or PG_PORT
     driver = driver or PG_DRIVER
     # override the default URL if PG_URL is set
     if PG_URL:
-        return PG_URL.strip()
+        parsed_url: ParseResult = urlparse(PG_URL.strip())
+        # keep existing scheme/netloc/query/fragment; swap just the path
+        new_path: str = "/" + quote(database)
+        return urlunparse(
+            (
+                parsed_url.scheme,
+                parsed_url.netloc,
+                new_path,
+                parsed_url.params,
+                parsed_url.query,
+                parsed_url.fragment,
+            )
+        )
 
     auth: str = f"{user}:{quote_plus(password)}" if password else user
     if not password:
-        logger.debug("Connecting to Postgres without password.")
+        logger.debug("Connecting to database without password.")
 
-    return f"postgresql+{driver}://{auth}@{host}:{port}/{database}"
+    protocol: str = DIALECT.get(PG_DRIVER)
+    if not protocol:
+        raise ValueError(
+            f"Unsupported PG_DRIVER={PG_DRIVER!r}; expected 'psycopg2' or 'pymysql'."
+        )
+
+    charset_qs: str = (
+        "?charset=utf8mb4" if (protocol == "mysql" and USE_UTF8MB4) else ""
+    )
+
+    return f"{protocol}+{driver}://{auth}@{host}:{port}/{database}{charset_qs}"
 
 
 def get_redis_url(

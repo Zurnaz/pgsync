@@ -10,12 +10,17 @@ from pgsync.exc import (
     TableNotInNodeError,
 )
 from pgsync.node import Tree
+from pgsync.settings import IS_MYSQL_COMPAT
 from pgsync.singleton import Singleton
 from pgsync.sync import Sync
 
 from .testing_utils import assert_resync_empty, noop, search, sort_list
 
 
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
 @pytest.mark.usefixtures("table_creator")
 class TestRoot(object):
     """Root only node tests."""
@@ -84,8 +89,7 @@ class TestRoot(object):
             raise
 
         sync.redis.delete()
-        session.connection().engine.connect().close()
-        session.connection().engine.dispose()
+        session.connection().engine.dispose(close=True)
         sync.search_client.close()
 
     def test_sync2(self, sync, data):
@@ -93,7 +97,7 @@ class TestRoot(object):
         nodes = {"table": "book", "columns": ["isbn", "title", "description"]}
         txmin = sync.checkpoint
         txmax = sync.txid_current
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [doc for doc in sync.sync(txmin=txmin, txmax=txmax)]
         assert docs == [
             {
@@ -148,7 +152,7 @@ class TestRoot(object):
             },
         }
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [doc for doc in sync.sync()]
         assert docs == [
             {
@@ -195,7 +199,7 @@ class TestRoot(object):
             "columns": ["isbn", "title", "description", "xmin"],
         }
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert sorted(docs[0]["_source"].keys()) == sorted(
             ["isbn", "title", "description", "xmin", "_meta"]
@@ -206,7 +210,7 @@ class TestRoot(object):
         """Test the doc includes xmin column."""
         nodes = {"table": "book", "columns": ["isbn", "xmin"]}
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert "xmin" in docs[0]["_source"]
         assert_resync_empty(sync, nodes)
@@ -215,7 +219,7 @@ class TestRoot(object):
         """Test we include all columns when no columns are specified."""
         nodes = {"table": "book", "columns": []}
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert sorted(docs[0]["_source"].keys()) == sorted(
             [
@@ -233,7 +237,7 @@ class TestRoot(object):
 
         nodes = {"table": "book"}
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert sorted(docs[0]["_source"].keys()) == sorted(
             [
@@ -265,7 +269,7 @@ class TestRoot(object):
         # TODO also repeat this test for composite primary key
         nodes = {"table": "book", "columns": ["title"]}
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert "abc" == docs[0]["_id"]
         assert "def" == docs[1]["_id"]
@@ -276,7 +280,7 @@ class TestRoot(object):
         """Test the private key is contained in the doc."""
         nodes = {"table": "book", "columns": ["isbn"]}
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert "_meta" in docs[0]["_source"]
         assert_resync_empty(sync, nodes)
@@ -285,7 +289,7 @@ class TestRoot(object):
         """Ensure the doc only selected columns and builtins."""
         nodes = {"table": "book", "columns": ["isbn", "xmin"]}
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         sources = {doc["_id"]: doc["_source"] for doc in docs}
 
@@ -303,7 +307,7 @@ class TestRoot(object):
             ],
         }
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         sources = {doc["_id"]: doc["_source"] for doc in docs}
 
@@ -319,7 +323,7 @@ class TestRoot(object):
         )
         nodes = {"table": "book", "columns": ["copyright", "publisher_id"]}
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
 
         docs = [sort_list(doc) for doc in sync.sync()]
         sources = {doc["_id"]: doc["_source"] for doc in docs}
@@ -340,7 +344,7 @@ class TestRoot(object):
             "columns": ["isbn", "description", "copyright"],
         }
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [doc for doc in sync.sync()]
         sources = {doc["_id"]: doc["_source"] for doc in docs}
 
@@ -370,7 +374,7 @@ class TestRoot(object):
         """Private keys should be included even if null."""
         nodes = {"table": "book", "columns": ["description"]}
         sync.nodes = nodes
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [doc for doc in sync.sync()]
         sources = {doc["_id"]: doc["_source"] for doc in docs}
 
@@ -469,6 +473,9 @@ class TestRoot(object):
         ]
         assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     # TODO: Add another test like this and change
     # both primary key and non primary key column
@@ -561,6 +568,9 @@ class TestRoot(object):
         ]
         assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_insert_non_concurrent(self, data, book_cls):
         """Test sync insert and then sync in non-concurrent mode."""
@@ -630,6 +640,9 @@ class TestRoot(object):
         ]
         assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_update_non_concurrent(self, data, book_cls):
         """Test sync update and then sync in non-concurrent mode."""
@@ -695,6 +708,9 @@ class TestRoot(object):
         ]
         assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_update_concurrent(self, data, book_cls):
         """Test sync update and then sync in concurrent mode."""
@@ -781,6 +797,9 @@ class TestRoot(object):
         ]
         assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_delete_concurrent(self, data, book_cls):
         """Test sync delete and then sync in concurrent mode."""
@@ -860,6 +879,9 @@ class TestRoot(object):
         ]
         assert_resync_empty(sync, doc.get("node", {}))
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_truncate(self, data, book_cls):
         """Test truncate."""

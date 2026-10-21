@@ -3,17 +3,16 @@
 import pytest
 from mock import MagicMock, patch
 
-from pgsync.settings import ELASTICSEARCH_PORT
+from pgsync.settings import ELASTICSEARCH_PORT, IS_MYSQL_COMPAT
 from pgsync.urls import (
     _get_auth,
-    get_postgres_url,
+    get_database_url,
     get_redis_url,
     get_search_url,
 )
 from pgsync.utils import validate_config
 
 
-@pytest.mark.usefixtures("table_creator")
 class TestUrls(object):
     """URLS tests."""
 
@@ -41,23 +40,32 @@ class TestUrls(object):
         )
         assert mock_logger.debug.call_count == 3
 
-    def test_get_postgres_url(self):
-        url = get_postgres_url("mydb")
-        assert url.endswith("@localhost:5432/mydb")
-        assert (
-            get_postgres_url("mydb", user="kermit", password="12345")
-            == "postgresql+psycopg2://kermit:12345@localhost:5432/mydb"
-        )
-        url = get_postgres_url("mydb", port=9999)
+    def test_get_database_url(self):
+        url = get_database_url("mydb")
+        if IS_MYSQL_COMPAT:
+            assert url.endswith("@localhost:3306/mydb")
+            assert (
+                get_database_url("mydb", user="kermit", password="12345")
+                == "mysql+pymysql://kermit:12345@localhost:3306/mydb"
+            )
+        else:
+            assert url.endswith("@localhost:5432/mydb")
+            assert (
+                get_database_url("mydb", user="kermit", password="12345")
+                == "postgresql+psycopg2://kermit:12345@localhost:5432/mydb"
+            )
+        url = get_database_url("mydb", port=9999)
         assert url.endswith("@localhost:9999/mydb")
-        # with patch("pgsync.urls.logger") as mock_logger:
-        #     assert (
-        #         get_postgres_url("mydb", user="kermit")
-        #         == "postgresql+psycopg2://kermit@localhost:5432/mydb"
-        #     )
-        #     mock_logger.debug.assert_called_once_with(
-        #         "Connecting to Postgres without password."
-        #     )
+        with patch("pgsync.urls.PG_PASSWORD", None):
+            with patch("pgsync.urls.logger") as mock_logger:
+                assert get_database_url("mydb", user="kermit") == (
+                    "mysql+pymysql://kermit@localhost:3306/mydb"
+                    if IS_MYSQL_COMPAT
+                    else "postgresql+psycopg2://kermit@localhost:5432/mydb"
+                )
+                mock_logger.debug.assert_called_once_with(
+                    "Connecting to database without password."
+                )
 
     @patch("pgsync.urls.logger")
     def test_get_redis_url(self, mock_logger):
@@ -97,11 +105,11 @@ class TestUrls(object):
         # Valid file path should not raise (uses current file)
         validate_config(config=__file__)
 
-        # Missing both config and s3_schema_url -> ValueError
+        # Missing all config, url and s3_schema_url -> ValueError
         with pytest.raises(ValueError) as excinfo:
             validate_config()
         assert (
-            "You must provide either a local config path or an S3 schema URL."
+            "You must provide either a local config path, a valid URL or an S3 URL"
             in str(excinfo.value)
         )
 

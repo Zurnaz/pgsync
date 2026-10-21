@@ -4,9 +4,14 @@ import pytest
 import sqlalchemy as sa
 
 from pgsync.base import Base
+from pgsync.settings import IS_MYSQL_COMPAT
 from pgsync.trigger import CREATE_TRIGGER_TEMPLATE
 
 
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
 @pytest.mark.usefixtures("table_creator")
 class TestTrigger(object):
     """Trigger tests."""
@@ -23,6 +28,8 @@ DECLARE
   _indices TEXT [];
   _primary_keys TEXT [];
   _foreign_keys TEXT [];
+  _columns TEXT [];
+  _changed BOOLEAN;
 
 BEGIN
     -- database is also the channel name.
@@ -30,8 +37,7 @@ BEGIN
 
     IF TG_OP = 'DELETE' THEN
 
-        SELECT primary_keys, indices
-        INTO _primary_keys, _indices
+        SELECT primary_keys, indices INTO _primary_keys, _indices
         FROM _view
         WHERE table_name = TG_TABLE_NAME;
 
@@ -41,14 +47,36 @@ BEGIN
             FROM JSON_EACH(old_row)
             WHERE key = ANY(_primary_keys)
         );
-        xmin := OLD.xmin;
+        -- use the deleting transaction's 64-bit txid, not OLD.xmin:
+        -- OLD.xmin is the row's creation txid and would drag the
+        -- checkpoint backwards when an old row is deleted
+        xmin := TXID_CURRENT();
     ELSE
         IF TG_OP <> 'TRUNCATE' THEN
 
-            SELECT primary_keys, foreign_keys, indices
-            INTO _primary_keys, _foreign_keys, _indices
+            SELECT primary_keys, foreign_keys, indices, columns
+            INTO _primary_keys, _foreign_keys, _indices, _columns
             FROM _view
             WHERE table_name = TG_TABLE_NAME;
+
+            -- normalize null to empty array
+            _columns := COALESCE(_columns, ARRAY[]::TEXT[]);
+
+            -- Only react if any _columns actually changed
+            IF TG_OP = 'UPDATE' THEN
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM JSONB_EACH(TO_JSONB(NEW.*)) n
+                    JOIN JSONB_EACH(TO_JSONB(OLD.*)) o USING (key)
+                    WHERE n.key = ANY(_columns)
+                    AND n.value IS DISTINCT FROM o.value
+                )
+                INTO _changed;
+
+                IF NOT _changed THEN
+                    RETURN NEW;  -- skip notification; nothing relevant changed
+                END IF;
+            END IF;
 
             new_row = ROW_TO_JSON(NEW);
             new_row := (
@@ -64,7 +92,9 @@ BEGIN
                     WHERE key = ANY(_primary_keys || _foreign_keys)
                 );
             END IF;
-            xmin := NEW.xmin;
+            -- 64-bit epoch-extended txid of the writing transaction:
+            -- immune to xid wraparound, unlike the raw 32-bit NEW.xmin
+            xmin := TXID_CURRENT();
         END IF;
     END IF;
 

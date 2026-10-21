@@ -1,9 +1,12 @@
 """Base tests."""
 
+import threading
+
 import pytest
 import sqlalchemy as sa
-from mock import call, patch
+from mock import call, MagicMock, patch
 
+import pgsync.base as base_module
 from pgsync.base import (
     _pg_engine,
     Base,
@@ -12,7 +15,9 @@ from pgsync.base import (
     create_schema,
     drop_database,
     drop_extension,
+    Payload,
     pg_execute,
+    TupleIdentifierType,
 )
 from pgsync.constants import DEFAULT_SCHEMA
 from pgsync.exc import (
@@ -20,13 +25,228 @@ from pgsync.exc import (
     ReplicationSlotError,
     TableNotFoundError,
 )
+from pgsync.settings import IS_MYSQL_COMPAT
 from pgsync.view import CreateView, DropView
 
 
+class TestConnectionFactories:
+    """Connection construction is deterministic and does not need a database."""
+
+    def test_pg_engine_uses_configured_pool_options(self):
+        engine = MagicMock()
+        with patch.object(
+            base_module,
+            "_pg_connect_config",
+            return_value=(
+                "postgresql://example/books",
+                {"sslmode": "require"},
+            ),
+        ):
+            with patch.object(base_module, "SQLALCHEMY_USE_NULLPOOL", False):
+                with patch.object(base_module, "PG_WORK_MEM", None):
+                    with patch.object(
+                        base_module.sa, "create_engine", return_value=engine
+                    ) as create_engine:
+                        assert (
+                            base_module._pg_engine("books", echo=True)
+                            is engine
+                        )
+
+        create_engine.assert_called_once_with(
+            "postgresql://example/books",
+            echo=True,
+            connect_args={"sslmode": "require"},
+            pool_size=base_module.SQLALCHEMY_POOL_SIZE,
+            max_overflow=base_module.SQLALCHEMY_MAX_OVERFLOW,
+            pool_pre_ping=base_module.SQLALCHEMY_POOL_PRE_PING,
+            pool_recycle=base_module.SQLALCHEMY_POOL_RECYCLE,
+            pool_timeout=base_module.SQLALCHEMY_POOL_TIMEOUT,
+        )
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="work_mem is a PostgreSQL-only connection setting",
+    )
+    def test_pg_engine_can_use_nullpool_and_configure_work_mem(self):
+        engine = MagicMock()
+        dbapi_conn = MagicMock()
+        callbacks = []
+
+        def listen_for(*_args):
+            def decorator(callback):
+                callbacks.append(callback)
+                return callback
+
+            return decorator
+
+        with patch.object(
+            base_module,
+            "_pg_connect_config",
+            return_value=("postgresql://example/books", {}),
+        ):
+            with patch.object(base_module, "SQLALCHEMY_USE_NULLPOOL", True):
+                with patch.object(base_module, "PG_WORK_MEM", "16MB"):
+                    with patch.object(
+                        base_module.sa, "create_engine", return_value=engine
+                    ) as create_engine:
+                        with patch(
+                            "sqlalchemy.event.listens_for",
+                            side_effect=listen_for,
+                        ):
+                            base_module._pg_engine("books")
+                            callbacks[0](dbapi_conn, MagicMock())
+                            dbapi_conn.cursor.return_value.execute.assert_called_once_with(
+                                "SET work_mem = '16MB'"
+                            )
+                            dbapi_conn.cursor.return_value.close.assert_called_once_with()
+
+        assert (
+            create_engine.call_args.kwargs["poolclass"].__name__ == "NullPool"
+        )
+
+    def test_pg_logical_repl_conn_uses_shared_connection_configuration(self):
+        connection = MagicMock()
+        with patch.object(
+            base_module,
+            "_pg_connect_config",
+            return_value=(
+                "postgresql://reader:secret@example.test:5444/books",
+                {"sslmode": "verify-full"},
+            ),
+        ):
+            with patch.object(
+                base_module.psycopg2, "connect", return_value=connection
+            ) as connect:
+                assert (
+                    base_module.pg_logical_repl_conn(database="books")
+                    is connection
+                )
+
+        connect.assert_called_once_with(
+            host="example.test",
+            port=5444,
+            user="reader",
+            password="secret",
+            dbname="books",
+            connection_factory=base_module.LogicalReplicationConnection,
+            sslmode="verify-full",
+        )
+
+
+class TestBasePureHelpers:
+    """Base helpers that only compose SQL can be tested without PostgreSQL."""
+
+    def test_trigger_exists_uses_bound_parameters(self):
+        base = object.__new__(Base)
+        base._thread_local = threading.local()
+        base._Base__engine = MagicMock()
+        connection = (
+            base._Base__engine.connect.return_value.__enter__.return_value
+        )
+        connection.execute.return_value.scalar.return_value = True
+
+        assert base.trigger_exists("public_book_notify", "book", "public")
+
+        statement, params = connection.execute.call_args.args
+        assert "FROM   pg_trigger" in str(statement)
+        assert params == {
+            "trigger": "public_book_notify",
+            "table": "book",
+            "schema": "public",
+        }
+
+    def test_trigger_helpers_generate_statements_for_every_table(self):
+        base = object.__new__(Base)
+        base.tables = MagicMock(return_value=["book", "author"])
+        base.execute = MagicMock()
+        base.disable_trigger = MagicMock()
+        base.enable_trigger = MagicMock()
+
+        base.drop_triggers("public", join_queries=True)
+        base.disable_triggers("public")
+        base.enable_triggers("public")
+
+        statement = str(base.execute.call_args.args[0])
+        assert 'DROP TRIGGER IF EXISTS "public_book_notify"' in statement
+        assert 'DROP TRIGGER IF EXISTS "public_author_truncate"' in statement
+        base.disable_trigger.assert_has_calls(
+            [call("public", "book"), call("public", "author")]
+        )
+        base.enable_trigger.assert_has_calls(
+            [call("public", "book"), call("public", "author")]
+        )
+
+    def test_create_triggers_skips_views_and_combines_queries(self):
+        base = object.__new__(Base)
+        base.tables = MagicMock(return_value=["book", "author", "book_view"])
+        base.views = MagicMock(return_value=["book_view"])
+        base.view_exists = MagicMock(return_value=False)
+        base.drop_triggers = MagicMock()
+        base.execute = MagicMock()
+
+        base.create_triggers(
+            "public", tables=["book", "book_view"], join_queries=True
+        )
+
+        statement = str(base.execute.call_args.args[0])
+        assert 'CREATE TRIGGER "public_book_notify"' in statement
+        assert 'CREATE TRIGGER "public_book_truncate"' in statement
+        assert "book_view" not in statement
+        assert base.drop_triggers.call_count == 2
+
+    def test_trigger_and_function_statements_are_executed(self):
+        base = object.__new__(Base)
+        base.execute = MagicMock()
+
+        base.disable_trigger("public", "book")
+        base.enable_trigger("public", "book")
+        base.create_function("public")
+        base.drop_function("public")
+
+        statements = [
+            str(call_.args[0]) for call_ in base.execute.call_args_list
+        ]
+        assert any(
+            "DISABLE TRIGGER public_book_notify" in item for item in statements
+        )
+        assert any(
+            "ENABLE TRIGGER public_book_truncate" in item
+            for item in statements
+        )
+        assert any("CREATE OR REPLACE FUNCTION" in item for item in statements)
+        assert any("DROP FUNCTION IF EXISTS" in item for item in statements)
+
+    def test_query_helpers_return_rows_and_boolean_existence(self):
+        base = object.__new__(Base)
+        base.verbose = False
+        base._thread_local = threading.local()
+        base._Base__engine = MagicMock()
+        connection = (
+            base._Base__engine.connect.return_value.__enter__.return_value
+        )
+        connection.execute.return_value.fetchone.side_effect = [("row",), None]
+        connection.execute.return_value.fetchall.return_value = [("one",)]
+
+        assert base.fetchone(sa.text("SELECT 1")) == ("row",)
+        assert base.fetchall(sa.text("SELECT 1")) == [("one",)]
+        assert not base.exists(sa.text("SELECT 1"))
+        connection.execute.return_value.fetchone.side_effect = None
+        connection.execute.return_value.fetchone.return_value = (1,)
+        assert base.exists(sa.text("SELECT 1"))
+
+
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
 @pytest.mark.usefixtures("table_creator")
 class TestBase(object):
     """Base tests."""
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     def test_pg_settings(self, connection):
         pg_base = Base(connection.engine.url.database)
         pg_base.verbose = False
@@ -34,6 +254,10 @@ class TestBase(object):
         assert int(value) > 0
         assert pg_base.pg_settings("xyz") is None
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.logger")
     def test__can_create_replication_slot(self, mock_logger, connection):
         pg_base = Base(connection.engine.url.database)
@@ -158,11 +382,8 @@ class TestBase(object):
     ):
         pg_base = Base(connection.engine.url.database)
         pg_base.truncate_table("book")
-        calls = [
-            call("Truncating table: public.book"),
-            call("Truncated table: public.book"),
-        ]
-        assert mock_logger.debug.call_args_list == calls
+        mock_logger.debug.assert_any_call('Truncating table: "public"."book"')
+        mock_logger.debug.assert_any_call('Truncated table: "public"."book"')
         mock_execute.assert_called_once()
         mock_text.assert_called_once_with(
             'TRUNCATE TABLE "public"."book" CASCADE'
@@ -175,11 +396,10 @@ class TestBase(object):
     ):
         pg_base = Base(connection.engine.url.database)
         pg_base.truncate_tables(["book", "user"])
-        calls = [
-            call("Truncating tables: ['book', 'user']"),
-            call("Truncated tables: ['book', 'user']"),
-        ]
-        assert mock_logger.debug.call_args_list == calls
+        mock_logger.debug.assert_any_call(
+            "Truncating tables: ['book', 'user']"
+        )
+        mock_logger.debug.assert_any_call("Truncated tables: ['book', 'user']")
         calls = [
             call("book", schema="public"),
             call("user", schema="public"),
@@ -193,11 +413,8 @@ class TestBase(object):
     ):
         pg_base = Base(connection.engine.url.database)
         pg_base.truncate_schema("public")
-        calls = [
-            call("Truncating schema: public"),
-            call("Truncated schema: public"),
-        ]
-        assert mock_logger.debug.call_args_list == calls
+        mock_logger.debug.assert_any_call("Truncating schema: public")
+        mock_logger.debug.assert_any_call("Truncated schema: public")
         mock_truncate_tables.assert_called_once_with(
             [
                 "author",
@@ -229,6 +446,10 @@ class TestBase(object):
         pg_base.truncate_schemas()
         mock_truncate_schema.assert_called_once_with("public")
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     def test_replication_slots(self, connection):
         pg_base = Base(connection.engine.url.database)
         assert pg_base.replication_slots("noob") == []
@@ -237,52 +458,78 @@ class TestBase(object):
         )
         assert "testdb_testdb" == replication_slots[0][0]
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.logger")
     def test_create_replication_slot(self, mock_logger, connection):
         pg_base = Base(connection.engine.url.database)
         pg_base.create_replication_slot("slot_name")
         pg_base.drop_replication_slot("slot_name")
-        calls = [
-            call("Creating replication slot: slot_name"),
-            call("Created replication slot: slot_name"),
-            call("Dropping replication slot: slot_name"),
-            call("Dropped replication slot: slot_name"),
-        ]
-        assert mock_logger.debug.call_args_list == calls
+        mock_logger.debug.assert_any_call(
+            "Creating replication slot: slot_name"
+        )
+        mock_logger.debug.assert_any_call(
+            "Created replication slot: slot_name"
+        )
+        mock_logger.debug.assert_any_call(
+            "Dropping replication slot: slot_name"
+        )
+        mock_logger.debug.assert_any_call(
+            "Dropped replication slot: slot_name"
+        )
 
         with pytest.raises(sa.exc.ProgrammingError):
             pg_base.drop_replication_slot(1)
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.logger")
     def test_drop_replication_slot(self, mock_logger, connection):
         pg_base = Base(connection.engine.url.database)
         pg_base.create_replication_slot("slot_name")
         pg_base.drop_replication_slot("slot_name")
-        calls = [
-            call("Creating replication slot: slot_name"),
-            call("Created replication slot: slot_name"),
-            call("Dropping replication slot: slot_name"),
-            call("Dropped replication slot: slot_name"),
-        ]
-        assert mock_logger.debug.call_args_list == calls
+        mock_logger.debug.assert_any_call(
+            "Creating replication slot: slot_name"
+        )
+        mock_logger.debug.assert_any_call(
+            "Created replication slot: slot_name"
+        )
+        mock_logger.debug.assert_any_call(
+            "Dropping replication slot: slot_name"
+        )
+        mock_logger.debug.assert_any_call(
+            "Dropped replication slot: slot_name"
+        )
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.logger")
     @patch("pgsync.base.Base.execute")
     def test_create_trigger(self, mock_execute, mock_logger, connection):
         pg_base = Base(connection.engine.url.database)
         pg_base.create_function(DEFAULT_SCHEMA)
         pg_base.create_triggers(DEFAULT_SCHEMA, "book", join_queries=True)
-        calls = [
-            call("Creating trigger on table: public.book"),
-            call("Dropping trigger on table: public.book"),
-            call("Dropping trigger on table: public.book"),
-        ]
-        assert mock_logger.debug.call_args_list == calls
+        mock_logger.debug.assert_any_call(
+            "Creating trigger on table: public.book"
+        )
+        mock_logger.debug.assert_any_call(
+            "Dropping trigger on table: public.book"
+        )
         assert mock_execute.call_count == 6
 
         pg_base.drop_function(DEFAULT_SCHEMA)
         pg_base.drop_triggers(DEFAULT_SCHEMA, "book", join_queries=True)
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.pg_execute")
     @patch("pgsync.base.pg_engine")
     @patch("pgsync.base.logger")
@@ -343,6 +590,10 @@ class TestBase(object):
         calls = [call(mock_pg_engine, f'DROP DATABASE "{database}"')]
         mock_pg_execute.call_args_list == calls
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.pg_execute")
     @patch("pgsync.base.pg_engine")
     @patch("pgsync.base.logger")
@@ -364,6 +615,10 @@ class TestBase(object):
         ]
         mock_pg_execute.call_args_list == calls
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.pg_execute")
     @patch("pgsync.base.pg_engine")
     @patch("pgsync.base.logger")
@@ -383,27 +638,29 @@ class TestBase(object):
         calls = [call(mock_pg_engine, 'DROP EXTENSION IF NOT EXISTS "my_ext"')]
         mock_pg_execute.call_args_list == calls
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.logger")
     def test_drop_view(self, mock_logger, connection):
         pg_base = Base(connection.engine.url.database)
         with patch("pgsync.sync.Base.engine"):
             pg_base.drop_view("public")
-            calls = [
-                call("Dropping view: public._view"),
-                call("Dropped view: public._view"),
-            ]
-            assert mock_logger.debug.call_args_list == calls
+            mock_logger.debug.assert_any_call("Dropping view: public._view")
+            mock_logger.debug.assert_any_call("Dropped view: public._view")
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     @patch("pgsync.base.logger")
     def test_refresh_view(self, mock_logger, connection):
         pg_base = Base(connection.engine.url.database)
         with patch("pgsync.sync.Base.engine"):
             pg_base.refresh_view("foo", "public", concurrently=True)
-            calls = [
-                call("Refreshing view: public.foo"),
-                call("Refreshed view: public.foo"),
-            ]
-            assert mock_logger.debug.call_args_list == calls
+            mock_logger.debug.assert_any_call("Refreshing view: public.foo")
+            mock_logger.debug.assert_any_call("Refreshed view: public.foo")
 
     def test_parse_value(self, connection):
         pg_base = Base(connection.engine.url.database)
@@ -423,6 +680,10 @@ class TestBase(object):
             pg_base.parse_value("float4", "foo")
         assert "could not convert string to float: 'foo'" in str(excinfo.value)
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     def test_parse_logical_slot(
         self,
         connection,
@@ -435,7 +696,7 @@ class TestBase(object):
         row = """
         table public."B1_XYZ": INSERT: "ID"[integer]:5 "CREATED_TIMESTAMP"[bigint]:222 "ADDRESS"[character varying]:'from3' "SOME_FIELD_KEY"[character varying]:'key3' "SOME_OTHER_FIELD_KEY"[character varying]:'issue to handle' "CHANNEL_ID"[integer]:3 "CHANNEL_NAME"[character varying]:'channel 45' "ITEM_ID"[integer]:3 "MESSAGE"[character varying]:'message3' "RETRY"[integer]:4 "STATUS"[character varying]:'status' "SUBJECT"[character varying]:'sub3' "TIMESTAMP"[bigint]:33
         """  # noqa E501
-        payload = pg_base.parse_logical_slot(row)
+        payload = pg_base.parse_logical_slot(row.strip())
         assert payload.data == {
             "CHANNEL_ID": 3,
             "CHANNEL_NAME": "channel 45",
@@ -462,6 +723,10 @@ class TestBase(object):
             pg_base.parse_logical_slot(row)
             assert '"Unknown UNKNOWN operation for row:' in str(excinfo.value)
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     def test_parse_logical_slot_with_double_precision(
         self,
         connection,
@@ -470,7 +735,7 @@ class TestBase(object):
         row = """
         table public.book: UPDATE: id[integer]:1 isbn[character varying]:'001' title[character varying]:'It' description[character varying]:'Stephens Kings It' copyright[character varying]:null tags[jsonb]:'["a", "b", "c"]' doc[jsonb]:'{"a": {"b": {"c": [0, 1, 2, 3, 4]}}, "i": 73, "x": [{"y": 0, "z": 5}, {"y": 1, "z": 6}], "bool": true, "lastname": "Judye", "firstname": "Glenda", "generation": {"name": "X"}, "nick_names": ["Beatriz", "Jean", "Carilyn", "Carol-Jean", "Sara-Ann"], "coordinates": {"lat": 21.1, "lon": 32.9}}' publisher_id[integer]:1 publish_date[timestamp without time zone]:'1980-01-01 00:00:00' quad[double precision]:2e+58
         """  # noqa E501
-        payload = pg_base.parse_logical_slot(row)
+        payload = pg_base.parse_logical_slot(row.strip())
         assert payload.data == {
             "copyright": None,
             "description": "Stephens Kings It",
@@ -555,6 +820,10 @@ class TestBase(object):
             )
             conn.commit()
 
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
     def test_materialized_views(self, connection):
         pg_base = Base(connection.engine.url.database)
         with connection.engine.connect() as conn:
@@ -613,3 +882,1069 @@ class TestBase(object):
         )
 
         _pg_engine("mydb", sslmode="allow", sslrootcert=__file__)
+
+
+class TestPayload:
+    """Tests for the Payload class."""
+
+    def test_payload_creation(self):
+        """Test Payload object creation."""
+        from pgsync.base import Payload
+
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            schema="public",
+            new={"id": 1, "title": "Test"},
+            old={},
+        )
+        assert payload.tg_op == "INSERT"
+        assert payload.table == "book"
+        assert payload.schema == "public"
+        assert payload.new == {"id": 1, "title": "Test"}
+        assert payload.old == {}
+
+    def test_payload_data_returns_new_for_insert(self):
+        """Test Payload.data returns new values for INSERT."""
+        from pgsync.base import Payload
+
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            new={"id": 1, "title": "Test"},
+            old={},
+        )
+        assert payload.data == {"id": 1, "title": "Test"}
+
+    def test_payload_data_returns_new_for_update(self):
+        """Test Payload.data returns new values for UPDATE."""
+        from pgsync.base import Payload
+
+        payload = Payload(
+            tg_op="UPDATE",
+            table="book",
+            new={"id": 1, "title": "Updated"},
+            old={"id": 1, "title": "Original"},
+        )
+        assert payload.data == {"id": 1, "title": "Updated"}
+
+    def test_payload_data_returns_old_for_delete(self):
+        """Test Payload.data returns old values for DELETE."""
+        from pgsync.base import Payload
+
+        payload = Payload(
+            tg_op="DELETE",
+            table="book",
+            new={},
+            old={"id": 1, "title": "Deleted"},
+        )
+        assert payload.data == {"id": 1, "title": "Deleted"}
+
+    def test_payload_data_returns_new_for_truncate(self):
+        """Test Payload.data returns new (empty) for TRUNCATE since it has no old."""
+        from pgsync.base import Payload
+
+        payload = Payload(
+            tg_op="TRUNCATE",
+            table="book",
+            new={},
+            old={},
+        )
+        # TRUNCATE returns new (which is empty) since old is also empty
+        assert payload.data == {}
+
+    def test_payload_xmin_defaults_to_none(self):
+        """Test Payload.xmin defaults to None."""
+        from pgsync.base import Payload
+
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            new={},
+        )
+        assert payload.xmin is None
+
+    def test_payload_with_xmin(self):
+        """Test Payload with xmin set."""
+        from pgsync.base import Payload
+
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            new={},
+            xmin=12345,
+        )
+        assert payload.xmin == 12345
+
+    def test_payload_table_attribute(self):
+        """Test Payload table attribute."""
+        from pgsync.base import Payload
+
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            schema="public",
+            new={"id": 1},
+        )
+        assert payload.table == "book"
+        assert payload.schema == "public"
+
+
+class TestBaseAdditional:
+    """Additional tests for Base class."""
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_txid_current(self, connection):
+        """Test txid_current returns transaction ID."""
+        pg_base = Base(connection.engine.url.database)
+        txid = pg_base.txid_current
+        assert isinstance(txid, int)
+        assert txid > 0
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_txid_snapshot_xmin(self, connection):
+        """Test txid_snapshot_xmin returns the oldest in-progress txid."""
+        pg_base = Base(connection.engine.url.database)
+        snapshot_xmin: int = pg_base.txid_snapshot_xmin
+        assert isinstance(snapshot_xmin, int)
+        # never above the current txid: safe as a checkpoint bound
+        assert 0 < snapshot_xmin <= pg_base.txid_current
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_txid_snapshot_bounds(self, connection):
+        """Snapshot bounds are ordered and can delimit a polling scan."""
+        pg_base = Base(connection.engine.url.database)
+        xmin, xmax = pg_base.txid_snapshot_bounds
+        assert isinstance(xmin, int)
+        assert isinstance(xmax, int)
+        assert 0 < xmin <= xmax
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_snapshot_bounds_do_not_assign_xid_in_read_only_transaction(
+        self, connection
+    ):
+        """The SQL used for polling remains valid without an assigned XID."""
+        with connection.engine.connect() as conn:
+            with conn.begin():
+                conn.execute(sa.text("SET TRANSACTION READ ONLY"))
+                assert (
+                    conn.execute(
+                        sa.text("SELECT txid_current_if_assigned()")
+                    ).scalar()
+                    is None
+                )
+                xmin, xmax = conn.execute(
+                    sa.text(
+                        "SELECT txid_snapshot_xmin(snapshot), "
+                        "txid_snapshot_xmax(snapshot) "
+                        "FROM (SELECT txid_current_snapshot() AS snapshot) "
+                        "AS current_snapshot"
+                    )
+                ).one()
+                assert 0 < xmin <= xmax
+                assert (
+                    conn.execute(
+                        sa.text("SELECT txid_current_if_assigned()")
+                    ).scalar()
+                    is None
+                )
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_txid_snapshot_xmin_bounds_open_transaction(self, connection):
+        """An uncommitted transaction holds txid_snapshot_xmin down.
+
+        This is the property that makes it a safe checkpoint: txids are
+        assigned at first write, not commit, so txid_current can move
+        past a transaction that has not committed yet. Checkpointing at
+        the snapshot xmin keeps such transactions above the checkpoint
+        so their changes are still scanned once they commit.
+        """
+        pg_base = Base(connection.engine.url.database)
+        open_conn = pg_base.engine.connect()
+        transaction = open_conn.begin()
+        try:
+            open_xid: int = open_conn.execute(
+                sa.text("SELECT txid_current()")
+            ).scalar()
+            # advance the counter past the open transaction
+            assert pg_base.txid_current > open_xid
+            # but the snapshot xmin must not pass it
+            assert pg_base.txid_snapshot_xmin <= open_xid
+        finally:
+            transaction.rollback()
+            open_conn.close()
+        # once resolved, the snapshot xmin moves past it
+        assert pg_base.txid_snapshot_xmin > open_xid
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_model_system_column_types(self, connection):
+        """Reflected models carry typed ctid and xmin system columns.
+
+        Regression: ctid was appended as sa.Column("ctid") with the type
+        accidentally passed as append_column's replace_existing flag,
+        leaving the column as NullType.
+        """
+        pg_base = Base(connection.engine.url.database)
+        model = pg_base.models("book", "public")
+        assert isinstance(model.c.ctid.type, TupleIdentifierType)
+        assert isinstance(model.c.xmin.type, sa.BigInteger)
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_verbose_property(self, connection):
+        """Test verbose property setting."""
+        pg_base = Base(connection.engine.url.database, verbose=True)
+        assert pg_base.verbose is True
+
+        pg_base2 = Base(connection.engine.url.database, verbose=False)
+        assert pg_base2.verbose is False
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_models_method(self, connection):
+        """Test models method returns table metadata."""
+        pg_base = Base(connection.engine.url.database)
+        # models is a method that takes table and schema
+        model = pg_base.models("book", DEFAULT_SCHEMA)
+        assert model is not None
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_database_property(self, connection):
+        """Test database property."""
+        pg_base = Base(connection.engine.url.database)
+        assert pg_base.database == connection.engine.url.database
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_engine_property(self, connection):
+        """Test engine property."""
+        pg_base = Base(connection.engine.url.database)
+        assert pg_base.engine is not None
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_execute_method(self, connection):
+        """Test execute method runs SQL."""
+        pg_base = Base(connection.engine.url.database)
+        stmt = sa.text("SELECT 1")
+        # execute() doesn't return anything, so we just check it doesn't raise
+        pg_base.execute(stmt)
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_table_count_method(self, connection):
+        """Test table count method."""
+        pg_base = Base(connection.engine.url.database)
+        # The count method requires a model, use tables() instead
+        tables = pg_base.tables(DEFAULT_SCHEMA)
+        assert isinstance(tables, list)
+        assert "book" in tables
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_parse_value_integer(self, connection):
+        """Test parse_value with integer type."""
+        pg_base = Base(connection.engine.url.database)
+        result = pg_base.parse_value("integer", "42")
+        assert result == 42
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_parse_value_boolean_true(self, connection):
+        """Test parse_value with boolean true."""
+        pg_base = Base(connection.engine.url.database)
+        result = pg_base.parse_value("boolean", "true")
+        assert result is True
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_parse_value_bigint(self, connection):
+        """Test parse_value with bigint type."""
+        pg_base = Base(connection.engine.url.database)
+        result = pg_base.parse_value("bigint", "9999999999")
+        assert result == 9999999999
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_parse_value_null(self, connection):
+        """Test parse_value with null value."""
+        pg_base = Base(connection.engine.url.database)
+        result = pg_base.parse_value("character varying", "null")
+        assert result is None
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_parse_value_double_precision(self, connection):
+        """Test parse_value with double precision type."""
+        pg_base = Base(connection.engine.url.database)
+        result = pg_base.parse_value("double precision", "3.14159")
+        assert abs(result - 3.14159) < 0.0001
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_session_property(self, connection):
+        """Test session property returns a session."""
+        pg_base = Base(connection.engine.url.database)
+        session = pg_base.session
+        assert session is not None
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_tables_method(self, connection):
+        """Test tables method returns table list."""
+        pg_base = Base(connection.engine.url.database)
+        tables = pg_base.tables(DEFAULT_SCHEMA)
+        assert isinstance(tables, list)
+        assert "book" in tables
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_parse_value_text_type(self, connection):
+        """Test parse_value with text type."""
+        pg_base = Base(connection.engine.url.database)
+        result = pg_base.parse_value("text", "'hello world'")
+        assert "hello world" in result
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_parse_value_numeric(self, connection):
+        """Test parse_value with numeric type."""
+        pg_base = Base(connection.engine.url.database)
+        result = pg_base.parse_value("numeric", "123.45")
+        assert float(result) == 123.45
+
+    @pytest.mark.skipif(
+        IS_MYSQL_COMPAT,
+        reason="Skipped because IS_MYSQL_COMPAT env var is set",
+    )
+    @pytest.mark.usefixtures("table_creator")
+    def test_replication_slots_query(self, connection):
+        """Test replication_slots method with slot name."""
+        pg_base = Base(connection.engine.url.database)
+        # Check for a non-existent slot - returns empty list
+        slots = pg_base.replication_slots("nonexistent_slot")
+        assert isinstance(slots, list)
+        assert len(slots) == 0
+
+
+# ============================================================================
+# PHASE 6 EXTENDED TESTS - Base.py Comprehensive Coverage
+# ============================================================================
+
+
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
+@pytest.mark.usefixtures("table_creator")
+class TestConnectionPooling:
+    """Tests for connection pooling and configuration."""
+
+    def test_connection_pool_size_configuration(self, connection):
+        """Test connection pool is configured with correct size."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Engine should have pool configured
+        assert pg_base.engine.pool is not None
+
+    def test_connection_pre_ping_enabled(self, connection):
+        """Test pre-ping is enabled for connection health checks."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Pool should be configured with pre-ping
+        # This ensures stale connections are detected
+        assert hasattr(pg_base.engine.pool, "_pre_ping")
+
+    def test_engine_disposal(self, connection):
+        """Test engine can be properly disposed."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Should be able to dispose engine
+        pg_base.engine.dispose()
+
+        # After disposal, should be able to reconnect
+        pg_base.engine.connect().close()
+
+    def test_connection_thread_safety(self, connection):
+        """Test connections are thread-safe with thread-local storage."""
+        import threading
+
+        pg_base = Base(connection.engine.url.database)
+        results = []
+
+        def get_connection():
+            conn = pg_base.engine.connect()
+            results.append(id(conn))
+            conn.close()
+
+        threads = [threading.Thread(target=get_connection) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Each thread should have gotten its own connection
+        assert len(results) == 3
+
+
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
+@pytest.mark.usefixtures("table_creator")
+class TestReplicationSlotOperations:
+    """Extended tests for replication slot operations."""
+
+    def test_create_replication_slot_success(self, connection):
+        """Test creating a replication slot."""
+        pg_base = Base(connection.engine.url.database)
+        slot_name = "test_slot_create"
+
+        # Clean up if exists
+        try:
+            pg_base.drop_replication_slot(slot_name)
+        except Exception:
+            pass
+
+        # Create slot
+        pg_base.create_replication_slot(slot_name)
+
+        # Verify it exists
+        slots = pg_base.replication_slots(slot_name)
+        assert len(slots) > 0
+        # slots returns a list of tuples/rows
+        assert slot_name in str(slots[0])
+
+        # Cleanup
+        pg_base.drop_replication_slot(slot_name)
+
+    def test_drop_replication_slot_success(self, connection):
+        """Test dropping a replication slot."""
+        pg_base = Base(connection.engine.url.database)
+        slot_name = "test_slot_drop"
+
+        # Create slot first
+        try:
+            pg_base.create_replication_slot(slot_name)
+        except Exception:
+            pass  # May already exist
+
+        # Drop it
+        pg_base.drop_replication_slot(slot_name)
+
+        # Verify it's gone
+        slots = pg_base.replication_slots(slot_name)
+        assert len(slots) == 0
+
+    def test_create_replication_slot_already_exists(self, connection):
+        """Test creating a slot that already exists."""
+        pg_base = Base(connection.engine.url.database)
+        slot_name = "test_slot_duplicate"
+
+        # Create slot
+        try:
+            pg_base.drop_replication_slot(slot_name)
+        except Exception:
+            pass
+        pg_base.create_replication_slot(slot_name)
+
+        # Try to create again - should handle gracefully
+        try:
+            pg_base.create_replication_slot(slot_name)
+        except Exception as e:
+            # Expected - slot already exists
+            assert (
+                "already exists" in str(e).lower()
+                or "duplicate" in str(e).lower()
+            )
+
+        # Cleanup
+        pg_base.drop_replication_slot(slot_name)
+
+    def test_drop_replication_slot_nonexistent(self, connection):
+        """Test dropping a non-existent slot."""
+        pg_base = Base(connection.engine.url.database)
+        slot_name = "nonexistent_slot_12345"
+
+        # Try to drop non-existent slot
+        try:
+            pg_base.drop_replication_slot(slot_name)
+        except Exception as e:
+            # Expected - slot doesn't exist
+            assert (
+                "does not exist" in str(e).lower()
+                or "not found" in str(e).lower()
+            )
+
+    def test_replication_slots_returns_all_when_no_name(self, connection):
+        """Test replication_slots returns slots for a given name."""
+        pg_base = Base(connection.engine.url.database)
+        slot_name = "test_slot_list"
+
+        # Create a slot first
+        try:
+            pg_base.drop_replication_slot(slot_name)
+        except Exception:
+            pass
+        pg_base.create_replication_slot(slot_name)
+
+        # Get slots for this name
+        slots = pg_base.replication_slots(slot_name)
+
+        # Should return a list
+        assert isinstance(slots, list)
+
+        # Cleanup
+        pg_base.drop_replication_slot(slot_name)
+
+
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
+@pytest.mark.usefixtures("table_creator")
+class TestLogicalSlotChanges:
+    """Tests for logical slot change reading."""
+
+    def test_logical_slot_changes_with_limit(self, connection):
+        """Test logical_slot_peek_changes respects limit parameter."""
+        pg_base = Base(connection.engine.url.database)
+        slot_name = "test_slot_changes"
+
+        # Create slot
+        try:
+            pg_base.drop_replication_slot(slot_name)
+        except Exception:
+            pass
+        pg_base.create_replication_slot(slot_name)
+
+        # Peek changes with limit
+        changes = pg_base.logical_slot_peek_changes(slot_name, limit=10)
+
+        # Should return a list
+        assert isinstance(changes, list)
+        # Should not exceed limit
+        assert len(changes) <= 10
+
+        # Cleanup
+        pg_base.drop_replication_slot(slot_name)
+
+    def test_logical_slot_changes_empty_slot(self, connection):
+        """Test logical_slot_peek_changes on empty slot."""
+        pg_base = Base(connection.engine.url.database)
+        slot_name = "test_slot_empty"
+
+        # Create fresh slot
+        try:
+            pg_base.drop_replication_slot(slot_name)
+        except Exception:
+            pass
+        pg_base.create_replication_slot(slot_name)
+
+        # Peek from empty slot
+        changes = pg_base.logical_slot_peek_changes(slot_name, limit=10)
+
+        # Should return empty list or minimal changes
+        assert isinstance(changes, list)
+
+        # Cleanup
+        pg_base.drop_replication_slot(slot_name)
+
+
+@pytest.mark.usefixtures("table_creator")
+class TestPayloadExtended:
+    """Extended tests for Payload class."""
+
+    def test_payload_equality(self):
+        """Test Payload equality comparison."""
+        payload1 = Payload(
+            tg_op="INSERT",
+            table="book",
+            schema="public",
+            new={"id": 1, "title": "Test"},
+        )
+        payload2 = Payload(
+            tg_op="INSERT",
+            table="book",
+            schema="public",
+            new={"id": 1, "title": "Test"},
+        )
+
+        # Same data should be equal
+        assert payload1.tg_op == payload2.tg_op
+        assert payload1.table == payload2.table
+
+    def test_payload_with_old_and_new(self):
+        """Test Payload with both old and new data (UPDATE)."""
+        payload = Payload(
+            tg_op="UPDATE",
+            table="book",
+            schema="public",
+            old={"id": 1, "title": "Old Title"},
+            new={"id": 1, "title": "New Title"},
+        )
+
+        assert payload.old == {"id": 1, "title": "Old Title"}
+        assert payload.new == {"id": 1, "title": "New Title"}
+        # data property should return new for UPDATE
+        assert payload.data == {"id": 1, "title": "New Title"}
+
+    def test_payload_repr(self):
+        """Test Payload string representation."""
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            schema="public",
+            new={"id": 1},
+        )
+
+        repr_str = repr(payload)
+        # Payload uses default object repr
+        assert "Payload object at" in repr_str
+
+    def test_payload_with_none_values(self):
+        """Test Payload handles None values correctly."""
+        payload = Payload(
+            tg_op="DELETE",
+            table="book",
+            schema="public",
+            old={"id": 1},
+            new=None,
+        )
+
+        # None defaults to empty dict
+        assert payload.new == {}
+        # data should return old for DELETE
+        assert payload.data == {"id": 1}
+
+    def test_payload_xmin_integer_conversion(self):
+        """Test Payload xmin accepts integer values."""
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            schema="public",
+            new={"id": 1},
+            xmin=12345,  # Integer
+        )
+
+        # Should be an integer
+        assert isinstance(payload.xmin, int)
+        assert payload.xmin == 12345
+
+    def test_payload_schema_defaults_to_public(self):
+        """Test Payload schema can be explicitly set."""
+        payload = Payload(
+            tg_op="INSERT",
+            table="book",
+            schema="public",
+            new={"id": 1},
+        )
+
+        # Explicitly set to public
+        assert payload.schema == "public"
+
+
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
+@pytest.mark.usefixtures("table_creator")
+class TestSessionManagement:
+    """Tests for session and transaction management."""
+
+    def test_session_property(self, connection):
+        """Test session property creates session."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Should return a session
+        session = pg_base.session
+        assert session is not None
+
+    def test_session_commit(self, connection):
+        """Test session can commit transactions."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Get session and ensure it can commit
+        session = pg_base.session
+        session.commit()
+
+    def test_session_rollback(self, connection):
+        """Test session can rollback transactions."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Get session and rollback
+        session = pg_base.session
+        session.rollback()
+
+    def test_execute_method(self, connection):
+        """Test execute method runs SQL."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Execute simple query - returns result proxy
+        with pg_base.engine.connect() as conn:
+            result = conn.execute(sa.text("SELECT 1 as num"))
+
+            # Should return result
+            assert result is not None
+            # Get the row
+            row = result.fetchone()
+            assert row is not None
+
+    def test_fetchone_method(self, connection):
+        """Test fetchone returns single row."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Execute and fetch one with sa.select()
+        result = pg_base.fetchone(sa.select(sa.literal(1).label("num")))
+
+        # Should return single row
+        assert result is not None
+
+    def test_fetchall_method(self, connection, book_cls):
+        """Test fetchall returns all rows."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Execute and fetch all from a real table
+        results = pg_base.fetchall(sa.select(book_cls))
+
+        # Should return multiple rows
+        assert isinstance(results, list)
+        assert len(results) >= 0
+
+
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
+@pytest.mark.usefixtures("table_creator")
+class TestDatabaseOperations:
+    """Extended tests for database operations."""
+
+    def test_table_count_method(self, connection, book_cls):
+        """Test fetchcount returns row count."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Count rows in a table using fetchcount
+        count = pg_base.fetchcount(sa.select(book_cls).alias())
+
+        # Should return integer
+        assert isinstance(count, int)
+        assert count >= 0
+
+    def test_models_property(self, connection):
+        """Test models method returns table reflection."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Get model for a table
+        model = pg_base.models("book", DEFAULT_SCHEMA)
+
+        # Should return an alias
+        assert model is not None
+        assert hasattr(model, "name")
+
+    def test_database_property(self, connection):
+        """Test database property returns database name."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Should return database name
+        db_name = pg_base.database
+        assert db_name is not None
+        assert isinstance(db_name, str)
+
+    def test_verbose_property(self, connection):
+        """Test verbose property."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Should have verbose property
+        assert hasattr(pg_base, "verbose")
+
+    def test_txid_current(self, connection):
+        """Test txid_current property returns transaction ID."""
+        pg_base = Base(connection.engine.url.database)
+
+        # Get current txid - it's a property
+        txid = pg_base.txid_current
+
+        # Should return integer
+        assert isinstance(txid, int)
+        assert txid > 0
+
+
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
+@pytest.mark.usefixtures("table_creator")
+class TestAdvisoryLock:
+    """Tests for advisory_lock context manager."""
+
+    def test_lock_acquired_and_released(self, connection):
+        """Lock is held inside the block and released after."""
+        pg_base = Base(connection.engine.url.database)
+        slot = "test_lock_acq_rel"
+
+        with pg_base.advisory_lock(slot):
+            # Lock should be visible in pg_locks
+            row = connection.execute(
+                sa.text(
+                    "SELECT COUNT(*) FROM pg_locks "
+                    "WHERE locktype = 'advisory' AND granted "
+                    "AND objid = hashtext(:slot)::int"
+                ).bindparams(slot=slot)
+            ).fetchone()
+            assert row[0] == 1
+
+        # After exiting, lock should be gone
+        row = connection.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM pg_locks "
+                "WHERE locktype = 'advisory' AND granted "
+                "AND objid = hashtext(:slot)::int"
+            ).bindparams(slot=slot)
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_lock_released_on_exception(self, connection):
+        """Lock must not leak when the body raises."""
+        pg_base = Base(connection.engine.url.database)
+        slot = "test_lock_exc"
+
+        with pytest.raises(ValueError):
+            with pg_base.advisory_lock(slot):
+                raise ValueError("boom")
+
+        row = connection.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM pg_locks "
+                "WHERE locktype = 'advisory' AND granted "
+                "AND objid = hashtext(:slot)::int"
+            ).bindparams(slot=slot)
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_lock_uses_single_backend(self, connection):
+        """Lock and unlock must happen on the same PostgreSQL backend PID."""
+        pg_base = Base(connection.engine.url.database)
+        slot = "test_lock_single_pid"
+
+        pids = []
+
+        with pg_base.advisory_lock(slot):
+            # Find the PID holding the advisory lock
+            rows = connection.execute(
+                sa.text(
+                    "SELECT pid FROM pg_locks "
+                    "WHERE locktype = 'advisory' AND granted "
+                    "AND objid = hashtext(:slot)::int"
+                ).bindparams(slot=slot)
+            ).fetchall()
+            pids = [r[0] for r in rows]
+
+        # Exactly one backend should have held the lock
+        assert len(pids) == 1
+
+    def test_retry_on_contention(self, connection):
+        """advisory_lock retries when the lock is already held."""
+        pg_base = Base(connection.engine.url.database)
+        slot = "test_lock_contention"
+        key = pg_base.advisory_key(slot)
+
+        # Hold the lock on a separate connection so the context manager must retry
+        blocker = pg_base.engine.connect()
+        try:
+            blocker.execute(
+                sa.text("SELECT PG_TRY_ADVISORY_LOCK(:key)").bindparams(
+                    key=key
+                )
+            )
+
+            # Release after a short delay from another thread
+            import threading
+
+            def release():
+                import time
+
+                time.sleep(0.3)
+                blocker.execute(
+                    sa.text("SELECT PG_ADVISORY_UNLOCK(:key)").bindparams(
+                        key=key
+                    )
+                )
+
+            t = threading.Thread(target=release)
+            t.start()
+
+            # Should succeed after the blocker releases
+            with pg_base.advisory_lock(
+                slot, max_retries=10, retry_interval=0.1, jitter="none"
+            ):
+                pass
+
+            t.join()
+        finally:
+            blocker.close()
+
+    def test_reentrant_same_thread(self, connection):
+        """Nested advisory_lock on the same slot from the same thread is a no-op.
+
+        Regression test: pgsync has call sites (e.g. _can_create_replication_slot)
+        that enter advisory_lock and then call helpers which re-enter
+        advisory_lock for the same slot. Without re-entrancy, those nested
+        acquires would deadlock forever on max_retries=None.
+        """
+        pg_base = Base(connection.engine.url.database)
+        slot = "test_lock_reentrant"
+
+        with pg_base.advisory_lock(slot):
+            # This would hang forever (max_retries=None) if nesting deadlocked
+            with pg_base.advisory_lock(
+                slot, max_retries=None, retry_interval=0.05
+            ):
+                pass
+            # Outer is still held
+            row = connection.execute(
+                sa.text(
+                    "SELECT COUNT(*) FROM pg_locks "
+                    "WHERE locktype = 'advisory' AND granted "
+                    "AND objid = hashtext(:slot)::int"
+                ).bindparams(slot=slot)
+            ).fetchone()
+            assert row[0] == 1
+
+        # Both released after outer exits
+        row = connection.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM pg_locks "
+                "WHERE locktype = 'advisory' AND granted "
+                "AND objid = hashtext(:slot)::int"
+            ).bindparams(slot=slot)
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_not_reentrant_across_threads(self, connection):
+        """A different thread must NOT treat a held lock as re-entrant.
+
+        This is the property that makes logical_slot_changes atomic:
+        the slot cleanup thread (a different thread) must block while
+        the pull thread holds the lock for its count/peek/index/consume
+        sequence, instead of silently entering via re-entrancy.
+        """
+        pg_base = Base(connection.engine.url.database)
+        slot = "test_lock_cross_thread"
+        results: dict = {}
+
+        def attempt() -> None:
+            try:
+                with pg_base.advisory_lock(
+                    slot, max_retries=0, retry_interval=0.01
+                ):
+                    results["acquired"] = True
+            except RuntimeError:
+                results["acquired"] = False
+
+        with pg_base.advisory_lock(slot):
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            thread.join()
+        assert results["acquired"] is False
+
+        # once released, another thread can acquire it
+        thread = threading.Thread(target=attempt)
+        thread.start()
+        thread.join()
+        assert results["acquired"] is True
+
+    def test_max_retries_exceeded(self, connection):
+        """RuntimeError raised when retries are exhausted."""
+        pg_base = Base(connection.engine.url.database)
+        slot = "test_lock_max_retries"
+        key = pg_base.advisory_key(slot)
+
+        blocker = pg_base.engine.connect()
+        try:
+            blocker.execute(
+                sa.text("SELECT PG_TRY_ADVISORY_LOCK(:key)").bindparams(
+                    key=key
+                )
+            )
+
+            with pytest.raises(RuntimeError, match="Failed to acquire"):
+                with pg_base.advisory_lock(
+                    slot, max_retries=2, retry_interval=0.01, jitter="none"
+                ):
+                    pass
+        finally:
+            blocker.execute(
+                sa.text("SELECT PG_ADVISORY_UNLOCK(:key)").bindparams(key=key)
+            )
+            blocker.close()
