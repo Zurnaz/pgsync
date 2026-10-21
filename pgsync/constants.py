@@ -1,14 +1,13 @@
-"""
-PGSync Constants.
+"""PGSync constants.
 
-This module contains constants used in PGSync.
-It includes constants for relationship types, relationship variants,
-node attributes, relationship attributes, relationship foreign keys,
-tg_op, JSONB operators, Elasticsearch types,
-Elasticsearch mapping parameters, transform types, default postgres schema,
-built-in schemas, primary key identifier, logical decoding output plugin,
-trigger function, materialized views, primary key delimiter,
-and replication slot patterns.
+This module defines constants used throughout PGSync, organized into:
+
+- Schema configuration: relationship types, variants, node/relationship attributes
+- Database operations: trigger operations (INSERT, UPDATE, DELETE, TRUNCATE)
+- PostgreSQL: JSONB operators, default schema, logical decoding plugin
+- Elasticsearch/OpenSearch: field types and mapping parameters
+- Transforms: field transformation types (concat, rename, replace, etc.)
+- Internal: materialized view definitions, replication slot patterns
 """
 
 import re
@@ -65,7 +64,7 @@ INSERT = "INSERT"
 DELETE = "DELETE"
 TRUNCATE = "TRUNCATE"
 
-TG_OP = [
+TG_OPS = [
     DELETE,
     INSERT,
     TRUNCATE,
@@ -135,6 +134,7 @@ ELASTICSEARCH_MAPPING_PARAMETERS = [
     "boost",
     "coerce",
     "copy_to",
+    "dimension",
     "doc_values",
     "dynamic",
     "eager_global_ordinals",
@@ -198,6 +198,7 @@ MATERIALIZED_VIEW_COLUMNS = [
     "indices",
     "primary_keys",
     "table_name",
+    "columns",
 ]
 
 # Primary key delimiter
@@ -205,8 +206,21 @@ PRIMARY_KEY_DELIMITER = "|"
 
 # Replication slot patterns
 LOGICAL_SLOT_PREFIX = re.compile(
-    r"table\s\"?(?P<schema>[\w-]+)\"?.\"?(?P<table>[\w-]+)\"?:\s(?P<tg_op>[A-Z]+):"  # noqa E501
+    r"^table\s+"
+    r'"?(?P<schema>[^"]+?)"?\.'  # schema up to the dot
+    r'"?(?P<table>[^"]+?)"?'  # table up to the colon
+    r"\s*:\s*(?P<tg_op>[A-Z]+):"
 )
 LOGICAL_SLOT_SUFFIX = re.compile(
-    r'\s(?P<key>"?\w+"?)\[(?P<type>[\w\s]+)\]:(?P<value>(?:"[^"]*"|\'[^\']*\'|null|\d+e[+-]?\d+|\w+))'
+    r"\s"
+    r'(?P<key>"(?:[^"]|"")+"|[\w$-]+)'  # "Weird Key" or my_col or my-col or my$col
+    r"\[(?P<type>[^\]]+)\]"  # anything until ]
+    r":"
+    r"(?P<value>"
+    r"null|true|false|NaN|Infinity|-Infinity|"
+    r'"(?:[^"]|"")*"|'  # double-quoted, supports "" escape
+    r"'(?:[^']|'')*'|"  # single-quoted, supports '' escape
+    r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|"  # numbers: -1, 3.14, 9e-3, 9E+2
+    r"[\w$-]+"  # bare tokens like uuid-ish or identifiers
+    r")"
 )

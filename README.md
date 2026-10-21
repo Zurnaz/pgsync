@@ -1,350 +1,386 @@
+<div align="center">
+
 # PGSync
 
-[![PyPI version](https://badge.fury.io/py/pgsync.svg)](https://badge.fury.io/py/pgsync)
-[![Build status](https://github.com/toluaina/pgsync/workflows/Build%20and%20Test/badge.svg)](https://github.com/toluaina/pgsync/actions)
-[![Python versions](https://img.shields.io/pypi/pyversions/pgsync)](https://pypi.org/project/pgsync)
-[![Downloads](https://img.shields.io/pypi/dm/pgsync)](https://pypi.org/project/pgsync)
-[![codecov](https://codecov.io/gh/toluaina/pgsync/branch/main/graph/badge.svg?token=cvQzYkz6CV)](https://codecov.io/gh/toluaina/pgsync)
+### Real-time PostgreSQL to Elasticsearch/OpenSearch sync
 
+**Keep your relational database as the source of truth while powering lightning-fast search**
 
-## PostgreSQL to Elasticsearch/OpenSearch sync
+[![PyPI version](https://img.shields.io/pypi/v/pgsync?color=blue&logo=pypi&logoColor=white)](https://pypi.org/project/pgsync)
+[![Python versions](https://img.shields.io/pypi/pyversions/pgsync?logo=python&logoColor=white)](https://pypi.org/project/pgsync)
+[![CI status](https://img.shields.io/github/actions/workflow/status/toluaina/pgsync/ci.yml?branch=main&logo=github)](https://github.com/toluaina/pgsync/actions)
+[![codecov](https://img.shields.io/codecov/c/github/toluaina/pgsync?logo=codecov&logoColor=white)](https://codecov.io/gh/toluaina/pgsync)
+[![Downloads](https://img.shields.io/pypi/dm/pgsync?color=brightgreen&logo=pypi&logoColor=white)](https://pypi.org/project/pgsync)
+[![License](https://img.shields.io/github/license/toluaina/pgsync?color=blue)](LICENSE)
 
-[PGSync](https://pgsync.com) is a middleware for syncing data from [Postgres](https://www.postgresql.org) to [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) effortlessly.
-It allows you to keep [Postgres](https://www.postgresql.org) as your source of truth and
-expose structured denormalized documents in [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/).
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/toluaina1/pgsync)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-Changes to nested entities are propagated to [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/).
-PGSync's advanced query builder then generates optimized SQL queries 
-on the fly based on your schema.
-PGSync's advisory model allows you to quickly move and transform large volumes of data quickly whilst maintaining relational integrity.
+[Live Demo ↗](https://demo.pgsync.com/) · [Website](https://pgsync.com) · [Documentation](https://pgsync.com) · [Examples](examples/) · [Report Bug](https://github.com/toluaina/pgsync/issues)
 
-Simply describe your document structure or schema in JSON and [PGSync](https://pgsync.com) will 
-continuously capture changes in your data and load it into [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) 
-without writing any code.
-[PGSync](https://pgsync.com) transforms your relational data into a structured document format.
+</div>
 
-It allows you to take advantage of the expressive power and scalability of 
-[Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) directly from [Postgres](https://www.postgresql.org). 
-You don't have to write complex queries and transformation pipelines.
-PGSync is lightweight, flexible and fast.
+---
 
-[Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) is more suited as as secondary denormalised search engine to accompany a more traditional normalized datastore.
-Moreover, you shouldn't store your primary data in [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/).
+## What is PGSync?
 
-So how do you then get your data into [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) in the first place? 
-Tools like [Logstash](https://www.elastic.co/products/logstash) and [Kafka](https://kafka.apache.org) can aid this task but they still require a bit 
-of engineering and development.
+PGSync is a change data capture tool that syncs data from **PostgreSQL**, **MySQL**, or **MariaDB** to **Elasticsearch** or **OpenSearch** in real-time. Define your document structure in JSON, and PGSync handles the rest — no custom code required.
 
-[Extract Transform Load](https://en.wikipedia.org/wiki/Extract,_transform,_load) and [Change data capture](https://en.wikipedia.org/wiki/Change_data_capture) tools can be complex and require expensive engineering effort.
+> **Django integration:** Use [django-pgsync](https://github.com/toluaina/django-pgsync/) to integrate PGSync with Django projects.
 
-Other benefits of PGSync include:
-- Real-time analytics
-- Reliable primary datastore/source of truth
-- Scale on-demand (multiple consumers)
-- Easily join multiple nested tables
+> **PGSync Pro:** Add real-time [semantic and hybrid search](https://pgsync.com/pro) to Elasticsearch or OpenSearch, with on-device or hosted embeddings that re-embed only when a document's meaning changes.
 
-#### Why?
+> **ClickHouse connector:** Stream PostgreSQL to [ClickHouse](https://clickhouse.com) in real time with [pgsync-clickhouse](https://pgsync.com/clickhouse), a change-data-capture sink that mirrors tables or builds denormalized wide tables on `ReplacingMergeTree` (one-to-one children flattened into typed columns, one-to-many into native `Array(Tuple(...))`), with exactly-once-on-replay keyed on the source WAL LSN.
 
-At a high level, you have data in a Postgres database and you want to mirror it in Elasticsearch/OpenSearch.  
-This means every change to your data (***Insert***, ***Update***, ***Delete*** and ***Truncate*** statements) needs to be replicated to Elasticsearch/OpenSearch. 
-At first, this seems easy and then it's not. Simply add some code to copy the data to Elasticsearch/OpenSearch after updating the database (or so called dual writes).
-Writing SQL queries spanning multiple tables and involving multiple relationships are hard to write.
-Detecting changes within a nested document can also be quite hard.
-Of course, if your data never changed, then you could just take a snapshot in time and load it into Elasticsearch/OpenSearch as a one-off operation.
+```mermaid
+%%{init: {'look': 'handDrawn', 'theme': 'neutral'}}%%
+flowchart LR
+    subgraph Source["🗄️ Source Database"]
+        DB[(PostgreSQL<br/>MySQL<br/>MariaDB)]
+    end
 
-PGSync is appropriate for you if:
-- [Postgres](https://www.postgresql.org) is your read/write source of truth whilst [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) is your 
-read-only search layer.
-- You need to denormalize relational data into a NoSQL data source.
-- Your data is constantly changing.
-- You have existing data in a relational database such as [Postgres](https://www.postgresql.org) and you need
-a secondary NoSQL database like [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) for text-based queries or autocomplete queries to mirror the existing data without having your application perform dual writes.
-- You want to keep your existing data untouched whilst taking advantage of
-the search capabilities of [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) by exposing a view of your data without compromising the security of your relational data.
-- Or you simply want to expose a view of your relational data for search purposes.
+    subgraph CDC["⚡ Change Data Capture"]
+        P[PGSync]
+    end
 
+    subgraph Search["🔍 Search Engine"]
+        ES[(Elasticsearch<br/>OpenSearch)]
+    end
 
-#### How it works
-
-PGSync is written in Python (supporting version 3.9 onwards) and the stack is composed of: [Redis](https://redis.io)/[Valkey](https://valkey.io), [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/), [Postgres](https://www.postgresql.org), and [SQLAlchemy](https://www.sqlalchemy.org).
-
-PGSync leverages the [logical decoding](https://www.postgresql.org/docs/current/logicaldecoding.html) feature of [Postgres](https://www.postgresql.org) (introduced in PostgreSQL 9.4) to capture a continuous stream of change events.
-This feature needs to be enabled in your [Postgres](https://www.postgresql.org) configuration file by setting in the postgresql.conf file:
-```
-wal_level = logical
+    DB -->|WAL / Binlog| P
+    P -->|Bulk Index| ES
 ```
 
-You can select any pivot table to be the root of your document.
+### Key Features
 
-PGSync's query builder builds advanced queries dynamically against your schema.
+| Feature | Description |
+|---------|-------------|
+| **Real-time sync** | Changes propagate instantly via logical replication |
+| **Zero code** | Define mappings in JSON — no ETL pipelines to build |
+| **Nested documents** | Automatically denormalize complex relationships |
+| **Fault tolerant** | Resumes from checkpoints after crashes |
+| **Transactionally consistent** | Documents appear in commit order |
+| **Minimal overhead** | Lightweight CDC with negligible database impact |
 
-PGSync operates in an event-driven model by creating triggers for tables in your database to handle notification events.
+---
 
-*This is the only time PGSync will ever make any changes to your database.*
+## Quick Start
 
-**NOTE**: **If you change the structure of your PGSync's schema config, you would need to rebuild your Elasticsearch/OpenSearch indices.**
-There are plans to support zero-downtime migrations to streamline this process.
+### Using Docker (Fastest)
 
-
-#### Quickstart
-
-There are several ways of installing and trying PGSync
- - [Running in Docker](#running-in-docker) is the easiest way to get up and running.
- - [Manual configuration](#manual-configuration) 
-
-
-##### Running in Docker (Using Github Repository)
-
-To startup all services with docker.
-
-```
-$ git checkout https://github.com/toluaina/pgsync
-```
-
-Run:
-```
-$ docker-compose up
-```
-
-Show the content in Elasticsearch/OpenSearch
-```
-$ curl -X GET http://[Elasticsearch/OpenSearch host]:9201/reservations/_search?pretty=true
-```
-
-
-##### Running with Docker (Using Image Repository)
-
-To start all services with Docker, follow these steps:
-
-1. Pull the Docker image:
-
-  ```
-  $ docker pull toluaina1/pgsync:latest
-  ```
-
-2. Run the container:
-
-  ```
-  $ docker run --rm -it \
-  -e REDIS_CHECKPOINT=true \
-  -e REDIS_HOST=<redis_host_address> \
-  -e PG_URL=postgres://<username>:<password>@<postgres_host>/<database> \
-  -e ELASTICSEARCH_URL=http://<elasticsearch_host>:9200 \
+```bash
+docker run --rm -it \
+  -e PG_URL=postgres://user:pass@host/db \
+  -e ELASTICSEARCH_URL=http://localhost:9200 \
+  -e REDIS_HOST=localhost \
   -v "$(pwd)/schema.json:/app/schema.json" \
   toluaina1/pgsync:latest -c schema.json -d -b
-  ```
+```
 
-Environment variable placeholders - full list [here](https://pgsync.com/env-vars):
+### Using pip
 
-- redis_host_address — Address of the Redis/Valkey server (e.g., host.docker.internal for local Docker setup)
-- username — PostgreSQL username
-- password — PostgreSQL password
-- postgres_host — Host address for PostgreSQL instance (e.g., host.docker.internal)
-- database — Name of PostgreSQL database
-- elasticsearch_host — Address of Elasticsearch/OpenSearch instance (e.g., host.docker.internal)
+```bash
+pip install pgsync
+```
 
+```bash
+# Bootstrap (one-time setup)
+bootstrap --config schema.json
 
-##### Manual configuration
+# Run sync
+pgsync --config schema.json -d
+```
 
-- Setup
-  - Ensure the database user is a superuser 
-  - Enable logical decoding. You would also need to set up at least two parameters at postgresql.conf
+### Using Docker Compose
 
-    ```wal_level = logical```
+**Default (Elasticsearch + Kibana):**
+```bash
+git clone https://github.com/toluaina/pgsync
+cd pgsync
+docker-compose up
+```
 
-    ```max_replication_slots = 1```
+This starts PostgreSQL, Redis, Elasticsearch, Kibana, and PGSync configured for Elasticsearch.
 
-  - To prevent your server logs from growing too large e.g when running on cloud infrastructure where there is a cost implication.
-    You can optionally impose a ceiling on the replication slot size using [max_slot_wal_keep_size](https://www.postgresql.org/docs/13/runtime-config-replication.html)
+**For OpenSearch:**
+```bash
+docker-compose --profile opensearch up
+```
 
-    ```max_slot_wal_keep_size = 100GB```
+This starts PostgreSQL, Redis, OpenSearch, and PGSync configured for OpenSearch.
 
-- Installation
-  - Install PGSync from pypi using pip
-    - ```$ pip install pgsync``` 
-  - Create a [schema.json](https://github.com/toluaina/pgsync/blob/main/examples/airbnb/schema.json) for your document representation
-  - Bootstrap the database (one time only)
-    - ```bootstrap --config schema.json```
-  - Run the program with 
-    - ```pgsync --config schema.json```
-  - Or as a daemon
-    - ```pgsync --config schema.json -d```
+**Ports:**
+- PostgreSQL: `15432`
+- Elasticsearch: `9201` (default)
+- Kibana: `5601` (default)
+- OpenSearch: `9400` (OpenSearch profile)
 
+---
 
-#### Features
+## How It Works
 
-Key features of PGSync are:
-
-- Easily denormalize relational data. 
-- Works with any PostgreSQL database (version 9.6 or later). 
-- Negligible impact on database performance.
-- Transactionally consistent output in Elasticsearch/OpenSearch. This means: writes appear only when they are committed to the database, insert, update and delete operations appear in the same order as they were committed (as opposed to eventual consistency).
-- Fault-tolerant: does not lose data, even if processes crash or a network interruption occurs, etc. The process can be recovered from the last checkpoint.
-- Returns the data directly as Postgres JSON from the database for speed.
-- Supports composite primary and foreign keys.
-- Supports Views and Materialized views.
-- Supports an arbitrary depth of nested entities i.e Tables having long chain of relationship dependencies.
-- Supports Postgres JSON data fields. This means: we can extract JSON fields in a database table as a separate field in the resulting document.
-- Customizable document structure.
-
-
-#### Requirements
-
-- [Python](https://www.python.org) 3.9+
-- [Postgres](https://www.postgresql.org) 9.6+
-- [Redis](https://redis.io) 3.1.0+ or [Valkey](https://valkey.io) 7.2.0+
-- [Elasticsearch](https://www.elastic.co/products/elastic-stack) 6.3.1+ or [OpenSearch](https://opensearch.org/) 1.3.7+
-- [SQLAlchemy](https://www.sqlalchemy.org) 1.3.4+
-
-
-#### Example
-
-Consider this example of a Book library database.
-
-**Book**
-
-| isbn *(PK)* | title | description |
-| ------------- | ------------- | ------------- |
-| 9785811243570 | Charlie and the chocolate factory | Willy Wonka’s famous chocolate factory is opening at last! |
-| 9788374950978 | Kafka on the Shore | Kafka on the Shore is a 2002 novel by Japanese author Haruki Murakami. |
-| 9781471331435 | 1984 | 1984 was George Orwell’s chilling prophecy about the dystopian future. |
-
-**Author**
-
-| id *(PK)* | name |
-| ------------- | ------------- |
-| 1 | Roald Dahl |
-| 2 | Haruki Murakami |
-| 3 | Philip Gabriel |
-| 4 | George Orwell |
-
-**BookAuthor**
-
-| id *(PK)* | book_isbn | author_id |
-| -- | ------------- | ---------- |
-| 1 | 9785811243570 | 1 |
-| 2 | 9788374950978 | 2 |
-| 3 | 9788374950978 | 3 |
-| 4 | 9781471331435 | 4 |
-
-With PGSync, we can simply define this [JSON](https://jsonapi.org) schema where the **_book_** table is the pivot.
-A **_pivot_** table indicates the root of your document.
+**1. Define your schema** — Map tables to document structure:
 
 ```json
 {
-    "table": "book",
-    "columns": [
-        "isbn",
-        "title",
-        "description"
-    ],
-    "children": [
-        {
-            "table": "author",
-            "columns": [
-                "name"
-            ]
-        }
-    ]
+  "table": "book",
+  "columns": ["isbn", "title", "description"],
+  "children": [{
+    "table": "author",
+    "columns": ["name"]
+  }]
 }
 ```
 
-To get this document structure in [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/)
+**2. PGSync generates optimized queries** — Complex JOINs handled automatically:
+
+```sql
+SELECT JSON_BUILD_OBJECT(
+  'isbn', book.isbn,
+  'title', book.title,
+  'authors', (SELECT JSON_AGG(author.name) FROM author ...)
+) FROM book
+```
+
+**3. Get denormalized documents** — Ready for search:
+
+```json
+{
+  "isbn": "9785811243570",
+  "title": "Charlie and the Chocolate Factory",
+  "authors": ["Roald Dahl"]
+}
+```
+
+Changes to any related table automatically update the document in Elasticsearch/OpenSearch.
+
+---
+
+## Requirements
+
+| Component | Version |
+|-----------|---------|
+| ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white) | 3.10+ |
+| ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-9.6+-4169E1?logo=postgresql&logoColor=white) | 9.6+ (or MySQL 5.7.22+ / MariaDB 10.5+) |
+| ![Elasticsearch](https://img.shields.io/badge/Elasticsearch-6.3+-005571?logo=elasticsearch&logoColor=white) | 6.3.1+ (or OpenSearch 1.3.7+) |
+| ![Redis](https://img.shields.io/badge/Redis-3.1+-DC382D?logo=redis&logoColor=white) | 3.1+ (or Valkey 7.2+) — optional in WAL mode |
+
+---
+
+## Database Setup
+
+<details>
+<summary><b>PostgreSQL</b></summary>
+
+Enable logical decoding in `postgresql.conf`:
+
+```ini
+wal_level = logical
+max_replication_slots = 1
+```
+
+Optionally limit WAL size:
+
+```ini
+max_slot_wal_keep_size = 100GB
+```
+
+</details>
+
+<details>
+<summary><b>MySQL / MariaDB</b></summary>
+
+Enable binary logging in `my.cnf`:
+
+```ini
+server-id = 1
+log_bin = mysql-bin
+binlog_row_image = FULL
+binlog_expire_logs_seconds = 604800
+```
+
+Create replication user:
+
+```sql
+CREATE USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'password';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'replicator'@'%';
+FLUSH PRIVILEGES;
+```
+
+</details>
+
+---
+
+## Example
+
+Consider a book library with related authors:
+
+| **Book** | | | |
+|----------|--|--|--|
+| isbn *(PK)* | title | description |
+| 9785811243570 | Charlie and the Chocolate Factory | Willy Wonka's famous... |
+| 9781471331435 | 1984 | George Orwell's chilling... |
+
+| **Author** | |
+|------------|--|
+| id *(PK)* | name |
+| 1 | Roald Dahl |
+| 4 | George Orwell |
+
+PGSync transforms this into search-ready documents:
 
 ```json
 [
   {
-      "isbn": "9785811243570",
-      "title": "Charlie and the chocolate factory",
-      "description": "Willy Wonka’s famous chocolate factory is opening at last!",
-      "authors": ["Roald Dahl"]
+    "isbn": "9785811243570",
+    "title": "Charlie and the Chocolate Factory",
+    "authors": ["Roald Dahl"]
   },
   {
-      "isbn": "9788374950978",
-      "title": "Kafka on the Shore",
-      "description": "Kafka on the Shore is a 2002 novel by Japanese author Haruki Murakami",
-      "authors": ["Haruki Murakami", "Philip Gabriel"]
-  },
-  {
-      "isbn": "9781471331435",
-      "title": "1984",
-      "description": "1984 was George Orwell’s chilling prophecy about the dystopian future",
-      "authors": ["George Orwell"]
+    "isbn": "9781471331435",
+    "title": "1984",
+    "authors": ["George Orwell"]
   }
 ]
 ```
 
-Behind the scenes, PGSync is generating advanced queries for you such as.
+**Any change** — updating an author's name, adding a new book, deleting a relationship — is automatically synced.
 
-```sql
-SELECT 
-       JSON_BUILD_OBJECT(
-          'isbn', book_1.isbn, 
-          'title', book_1.title, 
-          'description', book_1.description,
-          'authors', anon_1.authors
-       ) AS "JSON_BUILD_OBJECT_1",
-       book_1.id
-FROM book AS book_1
-LEFT OUTER JOIN
-  (SELECT 
-          JSON_AGG(anon_2.anon) AS authors,
-          book_author_1.book_isbn AS book_isbn
-   FROM book_author AS book_author_1
-   LEFT OUTER JOIN
-     (SELECT 
-             author_1.name AS anon,
-             author_1.id AS id
-      FROM author AS author_1) AS anon_2 ON anon_2.id = book_author_1.author_id
-   GROUP BY book_author_1.book_isbn) AS anon_1 ON anon_1.book_isbn = book_1.isbn
-```
+---
 
-You can also configure PGSync to rename attributes via the schema config
-e.g
+## Transforms
+
+PGSync supports built-in transforms to modify field values before indexing. Transforms are applied in order: `replace` → `rename` → `concat`.
+
+### Replace
+
+Find and replace substrings within field values:
 
 ```json
-  {
-      "isbn": "9781471331435",
-      "this_is_a_custom_title": "1984",
-      "desc": "1984 was George Orwell’s chilling prophecy about the dystopian future",
-      "contributors": ["George Orwell"]
+{
+  "table": "product",
+  "columns": ["code", "name"],
+  "transform": {
+    "replace": {
+      "code": {
+        "-": "/",
+        "_": " "
+      }
+    }
   }
+}
 ```
 
-PGSync addresses the following challenges:
-- What if we update the author's name in the database?
-- What if we wanted to add another author for an existing book?
-- What if we have lots of documents already with the same author we wanted to change the author name?
-- What if we delete or update an author?
-- What if we truncate an entire table?
+| Before | After |
+|--------|-------|
+| `ABC-DEF_GHI` | `ABC/DEF GHI` |
 
+### Rename
 
-#### Benefits
+Rename fields in the output document:
 
-- PGSync is a simple to use out of the box solution for Change data capture.
-- PGSync handles data deletions.
-- PGSync requires little development effort. You simply define a schema config describing your data.
-- PGSync generates advanced queries matching your schema directly.
-- PGSync allows you to easily rebuild your indexes in case of a schema change.
-- You can expose only the data you require in Elasticsearch/OpenSearch.
-- Supports multiple Postgres schemas for multi-tennant applications.
+```json
+{
+  "table": "book",
+  "columns": ["id", "title"],
+  "transform": {
+    "rename": {
+      "id": "book_id",
+      "title": "book_title"
+    }
+  }
+}
+```
 
+### Concat
 
-#### Contributing
+Combine multiple fields into a new field:
 
-Contributions are very welcome! Check out the [Contribution](CONTRIBUTING.rst) Guidelines for instructions.
+```json
+{
+  "table": "user",
+  "columns": ["first_name", "last_name"],
+  "transform": {
+    "concat": {
+      "columns": ["first_name", "last_name"],
+      "destination": "full_name",
+      "delimiter": " "
+    }
+  }
+}
+```
 
+### Combined Example
 
-#### Credits
+Transforms can be combined and applied to nested children:
 
-- This package was created with [Cookiecutter](https://github.com/audreyr/cookiecutter)
-- Elasticsearch is a trademark of Elasticsearch BV, registered in the U.S. and in other countries.
+```json
+{
+  "table": "book",
+  "columns": ["isbn", "title"],
+  "children": [{
+    "table": "publisher",
+    "columns": ["code", "name"],
+    "transform": {
+      "replace": { "code": { "-": "." } },
+      "rename": { "name": "publisher_name" }
+    }
+  }],
+  "transform": {
+    "concat": {
+      "columns": ["isbn", "title"],
+      "destination": "search_text",
+      "delimiter": " - "
+    }
+  }
+}
+```
 
+---
 
-#### License
+## Why PGSync?
 
-This project is licensed under the terms of the [MIT](https://opensource.org/license/mit/) license.
-Please see [LICENSE](LICENSE) for more details.
+| Challenge | PGSync Solution |
+|-----------|-----------------|
+| Dual writes are error-prone | Captures changes from WAL — single source of truth |
+| Complex JOIN queries | Auto-generates optimized SQL from your schema |
+| Nested document updates | Detects changes in any related table |
+| Data consistency | Transactionally consistent, ordered delivery |
+| Crash recovery | Checkpoint-based resumption |
 
-You should have received a copy of the MIT License along with PGSync.  
-If not, see https://opensource.org/license/mit/.
+---
+
+## Environment Variables
+
+Full list at [pgsync.com/env-vars](https://pgsync.com/env-vars)
+
+| Variable | Description |
+|----------|-------------|
+| `PG_URL` | PostgreSQL connection string |
+| `ELASTICSEARCH_URL` | Elasticsearch/OpenSearch URL |
+| `REDIS_HOST` | Redis/Valkey host |
+| `REDIS_CHECKPOINT` | Use Redis for checkpoints (recommended for production) |
+
+---
+
+## One-Click Deploy
+
+[![Deploy to DigitalOcean](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/toluaina/pgsync/tree/main)
+
+---
+
+## Sponsors
+
+<a href="https://www.digitalocean.com/?utm_medium=opensource&utm_source=pgsync">
+  <img src="https://opensource.nyc3.cdn.digitaloceanspaces.com/attribution/assets/SVG/DO_Logo_horizontal_blue.svg" alt="DigitalOcean" width="200">
+</a>
+
+---
+
+## Contributing
+
+Contributions welcome! See [CONTRIBUTING.rst](CONTRIBUTING.rst) for guidelines.
+
+## License
+
+[MIT](LICENSE) — use it freely in your projects.

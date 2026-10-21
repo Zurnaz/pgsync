@@ -5,7 +5,7 @@ import logging
 import typing as t
 
 from redis import Redis
-from redis.exceptions import ConnectionError
+from redis.exceptions import ConnectionError, ResponseError
 
 from .settings import (
     REDIS_READ_CHUNK_SIZE,
@@ -25,15 +25,35 @@ class RedisQueue(object):
         url: str = get_redis_url(**kwargs)
         self.key: str = f"{namespace}:{name}"
         self._meta_key: str = f"{self.key}:meta"
+        self.__db: Redis = Redis.from_url(
+            url,
+            socket_timeout=REDIS_SOCKET_TIMEOUT,
+            retry_on_timeout=REDIS_RETRY_ON_TIMEOUT,
+        )
         try:
-            self.__db: Redis = Redis.from_url(
-                url,
-                socket_timeout=REDIS_SOCKET_TIMEOUT,
-                retry_on_timeout=REDIS_RETRY_ON_TIMEOUT,
-            )
-            self.__db.ping()
-        except ConnectionError as e:
-            logger.exception(f"Redis server is not running: {e}")
+            self.ping()
+        except ConnectionError:
+            raise
+
+    @property
+    def client(self) -> Redis:
+        """The underlying Redis/Valkey client (for get/set style access)."""
+        return self.__db
+
+    def ping(self) -> bool:
+        """
+        Ping the Redis server to check connectivity.
+
+        Returns:
+            True if the server responded to PING.
+
+        Raises:
+            RedisConnectionError: If the server cannot be reached.
+        """
+        try:
+            return bool(self.__db.ping())
+        except ConnectionError:
+            logger.exception("Redis server is not reachable when pinging.")
             raise
 
     @property
@@ -69,18 +89,32 @@ class RedisQueue(object):
             return []
         payloads = [json.loads(i) for i in items]
         visible_map: dict = pg_visible_in_snapshot()(
-            [payload["xmin"] for payload in payloads]
+            [
+                payload["xmin"]
+                for payload in payloads
+                if payload.get("xmin") is not None
+            ]
         )
         visible: t.List[dict] = []
         for item, payload in zip(items, payloads):
-            if visible_map.get(payload["xmin"]):
+            if "xmin" not in payload:
+                # remove malformed payloads or they clog the queue head
+                # and every subsequent poll re-reads them forever
+                logger.warning(
+                    f"Removing payload without 'xmin' key: {payload}"
+                )
+                self.__db.lrem(self.key, 1, item)
+                continue
+            # a null xmin (e.g. TRUNCATE) is always safe to process:
+            # pg_notify only delivers after the transaction commits
+            if payload["xmin"] is None or visible_map.get(payload["xmin"]):
                 # Claim atomically
                 removed = self.__db.lrem(self.key, 1, item)
                 if removed:
                     visible.append(payload)
         return visible
 
-    def push(self, items: t.List) -> None:
+    def push(self, items: t.Iterable[dict]) -> None:
         """Push multiple items onto the queue."""
         self.__db.rpush(self.key, *map(json.dumps, items))
 
@@ -88,13 +122,30 @@ class RedisQueue(object):
         """Delete all items from the named queue."""
         logger.info(f"Deleting redis key: {self.key}")
         self.__db.delete(self.key)
+        self.__db.delete(self._meta_key)
         logger.info(f"Deleted redis key: {self.key}")
 
-    def set_meta(self, value: t.Any) -> None:
-        """Store an arbitrary JSON-serialisable value in a dedicated key."""
-        self.__db.set(self._meta_key, json.dumps(value))
+    def set_meta(self, value: dict) -> None:
+        """Store fields in a Redis hash (field-level, no cross-field overwrites)."""
+        encoded = {k: json.dumps(v) for k, v in value.items()}
+        try:
+            self.__db.hset(self._meta_key, mapping=encoded)
+        except ResponseError:
+            # Key exists as a non-hash type from a previous version; replace it.
+            self.__db.delete(self._meta_key)
+            self.__db.hset(self._meta_key, mapping=encoded)
 
     def get_meta(self, default: t.Any = None) -> t.Any:
-        """Retrieve the stored value (or *default* if nothing is set)."""
-        raw = self.__db.get(self._meta_key)
-        return json.loads(raw) if raw is not None else default
+        """Retrieve all stored fields as a dict."""
+        try:
+            raw: dict = self.__db.hgetall(self._meta_key)
+        except ResponseError:
+            # Key exists as a non-hash type from a previous version; discard it.
+            self.__db.delete(self._meta_key)
+            return default
+        if not raw:
+            return default
+        return {
+            (k.decode() if isinstance(k, bytes) else k): json.loads(v)
+            for k, v in raw.items()
+        }

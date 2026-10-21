@@ -5,9 +5,12 @@ from __future__ import annotations
 import re
 import threading
 import typing as t
+from collections import deque
 from dataclasses import dataclass
 
 import sqlalchemy as sa
+
+from pgsync.settings import IS_MYSQL_COMPAT
 
 from .constants import (
     DEFAULT_SCHEMA,
@@ -149,8 +152,9 @@ class Node(object):
         ]
         if not self.column_names:
             self.column_names = [str(column) for column in self.table_columns]
-            for name in ("ctid", "oid", "xmin"):
-                self.column_names.remove(name)
+            if not IS_MYSQL_COMPAT:
+                for name in ("ctid", "oid", "xmin"):
+                    self.column_names.remove(name)
 
         if self.label is None:
             self.label = self.table
@@ -163,11 +167,19 @@ class Node(object):
         self._mapping: dict = {}
 
         for through_table in self.relationship.tables:
+            if "." in through_table:
+                through_schema, through_table_name = through_table.split(
+                    ".", 1
+                )
+            else:
+                through_schema = self.schema
+                through_table_name = through_table
+            through_table = through_table_name
             self.relationship.throughs.append(
                 Node(
                     models=self.models,
                     table=through_table,
-                    schema=self.schema,
+                    schema=through_schema,
                     parent=self,
                     primary_key=[],
                 )
@@ -186,45 +198,112 @@ class Node(object):
         self.columns = []
 
         for column_name in self.column_names:
-            tokens: t.Optional[list] = None
+            tokens = None
             if any(op in column_name for op in JSONB_OPERATORS):
                 tokens = re.split(
-                    f"({'|'.join(JSONB_OPERATORS)})",
-                    column_name,
+                    f"({'|'.join(JSONB_OPERATORS)})", column_name
                 )
 
             if tokens:
-                tokenized = self.model.c[tokens[0]]
-                for token in tokens[1:]:
-                    if token in JSONB_OPERATORS:
-                        tokenized = tokenized.op(token)
-                        continue
-                    if token.isdigit():
-                        token = int(token)
-                    tokenized = tokenized(token)
-                self.columns.append(
-                    "_".join(
-                        [
+                if IS_MYSQL_COMPAT:
+                    base_col = tokens[0].strip()
+                    if not base_col:
+                        raise ValueError(
+                            f"Invalid JSON column expression: {column_name!r}"
+                        )
+
+                    text_mode = any(
+                        tok in ("->>", "#>>")
+                        for tok in tokens
+                        if tok in JSONB_OPERATORS
+                    )
+
+                    path_parts = []
+
+                    def add_path_piece(tok: str):
+                        tok = tok.strip()
+                        if not tok:
+                            return
+                        if tok.startswith("{") and tok.endswith(
+                            "}"
+                        ):  # brace form: {a,b,0}
+                            inner = tok[1:-1]
+                            for part in [
+                                p.strip().strip('"').strip("'")
+                                for p in inner.split(",")
+                                if p.strip()
+                            ]:
+                                if part.isdigit():
+                                    path_parts.append(f"[{int(part)}]")
+                                else:
+                                    part = part.replace('"', r"\"")
+                                    path_parts.append(f'."{part}"')
+                        else:  # single key or index
+                            if tok.isdigit():
+                                path_parts.append(f"[{int(tok)}]")
+                            else:
+                                tok = (
+                                    tok.strip('"')
+                                    .strip("'")
+                                    .replace('"', r"\"")
+                                )
+                                path_parts.append(f'."{tok}"')
+
+                    for tok in tokens[1:]:
+                        if tok in JSONB_OPERATORS:
+                            continue
+                        add_path_piece(tok)
+
+                    json_path = "$" + "".join(path_parts)
+                    extracted = sa.func.JSON_EXTRACT(
+                        self.model.c[base_col], json_path
+                    )
+                    tokenized = (
+                        sa.func.JSON_UNQUOTE(extracted)
+                        if text_mode
+                        else extracted
+                    )
+
+                    # alias (same logic as your original)
+                    self.columns.append(
+                        "_".join(
                             x.replace("{", "").replace("}", "")
                             for x in tokens
                             if x not in JSONB_OPERATORS
-                        ]
+                        )
                     )
-                )
-                self.columns.append(tokenized)
-                # compiled_query(self.columns[-1], 'JSONB Query')
+                    self.columns.append(tokenized)
+
+                else:
+                    tokenized = self.model.c[tokens[0]]
+                    for token in tokens[1:]:
+                        if token in JSONB_OPERATORS:
+                            tokenized = tokenized.op(token)
+                            continue
+                        if token.isdigit():
+                            token = int(token)
+                        tokenized = tokenized(token)
+                    self.columns.append(
+                        "_".join(
+                            [
+                                x.replace("{", "").replace("}", "")
+                                for x in tokens
+                                if x not in JSONB_OPERATORS
+                            ]
+                        )
+                    )
+                    self.columns.append(tokenized)
 
             else:
                 if column_name not in self.table_columns:
                     raise ColumnNotFoundError(
-                        f'Column "{column_name}" not present on '
-                        f'table "{self.table}"'
+                        f'Column "{column_name}" not present on table "{self.table}"'
                     )
                 self.columns.append(column_name)
                 self.columns.append(self.model.c[column_name])
 
     @property
-    def primary_keys(self):
+    def primary_keys(self) -> t.List[sa.sql.ColumnElement]:
         return [
             self.model.c[str(sa.text(primary_key))]
             for primary_key in self.model.primary_keys
@@ -241,7 +320,7 @@ class Node(object):
 
     def add_child(self, node: Node) -> None:
         """All nodes except the root node must have a relationship defined."""
-        node.parent: Node = self
+        node.parent = self
         if not node.is_root and (
             not node.relationship.type or not node.relationship.variant
         ):
@@ -264,12 +343,12 @@ class Node(object):
             child.display(prefix, leaf)
 
     def traverse_breadth_first(self) -> t.Generator:
-        stack: t.List[Node] = [self]
-        while stack:
-            node: Node = stack.pop(0)
+        queue: deque = deque([self])
+        while queue:
+            node: Node = queue.popleft()
             yield node
             for child in node.children:
-                stack.append(child)
+                queue.append(child)
 
     def traverse_post_order(self) -> t.Generator:
         for child in self.children:
@@ -281,6 +360,7 @@ class Node(object):
 class Tree(threading.local):
     models: t.Callable
     nodes: dict
+    database: str
 
     def __post_init__(self):
         self.tables: t.Set[str] = set()
@@ -303,15 +383,23 @@ class Tree(threading.local):
             raise SchemaError(
                 "Incompatible schema. Please run v2 schema migration"
             )
+
         table: str = nodes.get("table")
-        schema: str = nodes.get("schema", DEFAULT_SCHEMA)
+        schema: str = (
+            self.database
+            if IS_MYSQL_COMPAT
+            else nodes.get("schema", DEFAULT_SCHEMA)
+        )
+
         key: t.Tuple[str, str] = (schema, table)
 
         if table is None:
             raise TableNotInNodeError(f"Table not specified in node: {nodes}")
 
         if not set(nodes.keys()).issubset(set(NODE_ATTRIBUTES)):
-            attrs = set(nodes.keys()).difference(set(NODE_ATTRIBUTES))
+            attrs: t.Set[str] = set(nodes.keys()).difference(
+                set(NODE_ATTRIBUTES)
+            )
             raise NodeAttributeError(f"Unknown node attribute(s): {attrs}")
 
         node: Node = Node(

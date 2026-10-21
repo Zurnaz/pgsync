@@ -6,12 +6,17 @@ import pytest
 
 from pgsync.base import subtransactions
 from pgsync.node import Tree
+from pgsync.settings import IS_MYSQL_COMPAT
 from pgsync.singleton import Singleton
 from pgsync.sync import Sync
 
 from .testing_utils import assert_resync_empty, noop, search, sort_list
 
 
+@pytest.mark.skipif(
+    IS_MYSQL_COMPAT,
+    reason="Skipped because IS_MYSQL_COMPAT env var is set",
+)
 @pytest.mark.usefixtures("table_creator")
 class TestNestedChildren(object):
     """Root and nested childred node tests."""
@@ -283,8 +288,7 @@ class TestNestedChildren(object):
             raise
 
         sync.redis.delete()
-        session.connection().engine.connect().close()
-        session.connection().engine.dispose()
+        session.connection().engine.dispose(close=True)
         sync.search_client.close()
 
     @pytest.fixture(scope="function")
@@ -381,7 +385,7 @@ class TestNestedChildren(object):
 
     def test_sync(self, sync, nodes, data):
         """Test regular sync produces the correct result."""
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync()]
         assert len(docs) == 3
         docs = sorted(docs, key=lambda k: k["_id"])
@@ -804,6 +808,9 @@ class TestNestedChildren(object):
         ]
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_update_root(self, data, nodes, book_cls):
         doc = {
@@ -919,6 +926,9 @@ class TestNestedChildren(object):
 
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_delete_root(
         self,
@@ -996,7 +1006,7 @@ class TestNestedChildren(object):
                             sync.search_client.refresh("testdb")
 
         txmin = sync.checkpoint
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         docs = [sort_list(doc) for doc in sync.sync(txmin=txmin)]
         assert len(docs) == 0
 
@@ -1134,6 +1144,9 @@ class TestNestedChildren(object):
 
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_insert_through_child_op2(
         self, book_cls, group_cls, book_group_cls, data
@@ -1161,7 +1174,7 @@ class TestNestedChildren(object):
         }
 
         sync = Sync(doc)
-        sync.tree = Tree(sync.models, nodes)
+        sync.tree = Tree(sync.models, nodes, database=sync.database)
         session = sync.session
 
         with subtransactions(session):
@@ -1285,6 +1298,9 @@ class TestNestedChildren(object):
             },
         ]
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_update_through_child_noop(self, sync, data):
         # update a new through child with noop
@@ -1796,6 +1812,9 @@ class TestNestedChildren(object):
 
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_insert_grand_child_through_child_op(
         self,
@@ -1898,6 +1917,9 @@ class TestNestedChildren(object):
 
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_delete_through_child_op(self, sync, data, nodes, book_author_cls):
         # delete a new through child with op
@@ -2085,6 +2107,9 @@ class TestNestedChildren(object):
 
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_insert_nonthrough_child_noop(
         self,
@@ -2134,6 +2159,9 @@ class TestNestedChildren(object):
 
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_update_nonthrough_child_noop(self, data, nodes, shelf_cls):
         # update a new non-through child with noop
@@ -2168,10 +2196,13 @@ class TestNestedChildren(object):
 
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_delete_nonthrough_child_noop(self, data, nodes, shelf_cls):
         # delete a new non-through child with noop
-        doc = {
+        doc: dict = {
             "index": "testdb",
             "database": "testdb",
             "nodes": nodes,
@@ -2203,6 +2234,9 @@ class TestNestedChildren(object):
 
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_insert_nonthrough_child_op(self, sync, data):
         # insert a new non-through child with op
@@ -2372,6 +2406,9 @@ class TestNestedChildren(object):
         docs = search(sync.search_client, "testdb")
         assert_resync_empty(sync, nodes)
         sync.search_client.close()
+        sync.session.close()
+        sync.engine.dispose(close=True)
+        Singleton._instances = {}
 
     def test_insert_deep_nested_fk_nonthrough_child_op(
         self,

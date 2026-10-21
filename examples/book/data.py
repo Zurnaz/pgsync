@@ -3,6 +3,7 @@ import random
 import typing as t
 
 import click
+import sqlalchemy as sa
 from faker import Faker
 from schema import (
     Author,
@@ -25,7 +26,12 @@ from sqlalchemy.orm import sessionmaker
 from pgsync.base import pg_engine, subtransactions
 from pgsync.constants import DEFAULT_SCHEMA
 from pgsync.helper import teardown
-from pgsync.utils import config_loader, validate_config
+from pgsync.settings import IS_MYSQL_COMPAT, S3_SCHEMA_URL, SCHEMA_URL
+from pgsync.utils import (
+    config_loader,
+    MutuallyExclusiveOption,
+    validate_config,
+)
 
 
 @click.command()
@@ -35,19 +41,55 @@ from pgsync.utils import config_loader, validate_config
     help="Schema config",
     type=click.Path(exists=True),
 )
+@click.option(
+    "--schema_url",
+    help="URL for schema config",
+    type=click.STRING,
+    default=SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "s3_schema_url"],
+)
+@click.option(
+    "--s3_schema_url",
+    help="S3 URL for schema config",
+    type=click.STRING,
+    default=S3_SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "schema_url"],
+)
 @click.option("--nsize", "-n", default=1, help="Number of dummy data samples")
-def main(config: str, nsize: int):
-    validate_config(config)
-    teardown(drop_db=False, config=config)
+def main(config: str, schema_url: str, s3_schema_url: str, nsize: int):
+    validate_config(
+        config,
+        schema_url=schema_url,
+        s3_schema_url=s3_schema_url,
+    )
+    teardown(
+        drop_db=False,
+        config=config,
+        schema_url=schema_url,
+        s3_schema_url=s3_schema_url,
+    )
 
-    for doc in config_loader(config):
+    for doc in config_loader(
+        config, schema_url=schema_url, s3_schema_url=s3_schema_url
+    ):
         database: str = doc.get("database", doc["index"])
         with pg_engine(database) as engine:
             schema: str = doc.get("schema", DEFAULT_SCHEMA)
-            connection = engine.connect().execution_options(
-                schema_translate_map={None: schema}
+            schema_translate_map: dict = {}
+            if not IS_MYSQL_COMPAT:
+                schema_translate_map = {None: schema}
+            connection: (
+                sa.engine.base.Connection
+            ) = engine.connect().execution_options(
+                schema_translate_map=schema_translate_map
             )
-            Session = sessionmaker(bind=connection, autoflush=True)
+            Session: sa.orm.sessionmaker = sessionmaker(
+                bind=connection, autoflush=True
+            )
             session = Session()
 
             # Bootstrap
@@ -213,7 +255,7 @@ def main(config: str, nsize: int):
                         "x": [{"y": 2, "z": 3}, {"y": 7, "z": 2}],
                         "generation": {"name": "X"},
                     },
-                    publish_date="infinity",
+                    # publish_date="infinity",
                 ),
                 "003": Book(
                     isbn="003",
@@ -238,7 +280,7 @@ def main(config: str, nsize: int):
                         "x": [{"y": 3, "z": 5}, {"y": 8, "z": 2}],
                         "generation": {"name": "X"},
                     },
-                    publish_date="-infinity",
+                    # publish_date="-infinity",
                 ),
                 "004": Book(
                     isbn="004",
