@@ -257,12 +257,14 @@ class Sync(Base, metaclass=Singleton):
         for node in self.tree.traverse_breadth_first():
             # ensure internal materialized view compatibility
             if MATERIALIZED_VIEW in self._materialized_views(node.schema):
-                if set(MATERIALIZED_VIEW_COLUMNS) != set(
-                    self.columns(node.schema, MATERIALIZED_VIEW)
-                ):
+                columns: list = self.columns(node.schema, MATERIALIZED_VIEW)
+                if set(MATERIALIZED_VIEW_COLUMNS) != set(columns):
                     raise RuntimeError(
                         f"Required materialized view columns not present on "
-                        f"{MATERIALIZED_VIEW}. Please re-run bootstrap."
+                        f"{node.schema}.{MATERIALIZED_VIEW}: found "
+                        f"{sorted(columns)}, expected "
+                        f"{sorted(MATERIALIZED_VIEW_COLUMNS)}. "
+                        f"Please re-run bootstrap."
                     )
 
             if node.schema not in self.schemas:

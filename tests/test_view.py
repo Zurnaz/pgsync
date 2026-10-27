@@ -5,7 +5,10 @@ import sqlalchemy as sa
 from mock import call, patch
 
 from pgsync.base import Base, create_schema, subtransactions
-from pgsync.constants import DEFAULT_SCHEMA
+from pgsync.constants import (
+    DEFAULT_SCHEMA,
+    MATERIALIZED_VIEW_COLUMNS,
+)
 from pgsync.settings import IS_MYSQL_COMPAT
 from pgsync.view import (
     _foreign_keys,
@@ -306,6 +309,100 @@ class TestView(object):
                 sa.text("DROP SCHEMA IF EXISTS myschema CASCADE")
             )
             connection.commit()
+
+    def test_create_view_rebuilds_incompatible_view(
+        self, connection, book_cls
+    ):
+        """A `_view` written by an older pgsync is rebuilt, not fatal."""
+        pg_base = Base(connection.engine.url.database)
+
+        def fetchall(statement):
+            return connection.execute(statement).fetchall()
+
+        # legacy view: no `columns` (pgsync < 3.x)
+        connection.execute(
+            sa.text(f"DROP MATERIALIZED VIEW IF EXISTS {DEFAULT_SCHEMA}._view")
+        )
+        connection.execute(
+            sa.text(
+                f"CREATE MATERIALIZED VIEW {DEFAULT_SCHEMA}._view AS "
+                "SELECT 'book'::text AS table_name, "
+                "ARRAY['isbn']::text[] AS primary_keys, "
+                "ARRAY[]::text[] AS foreign_keys, "
+                "ARRAY[]::text[] AS indices"
+            )
+        )
+        connection.commit()
+
+        with patch("pgsync.view.logger") as mock_logger:
+            create_view(
+                connection.engine,
+                pg_base.models,
+                fetchall,
+                "testdb",
+                DEFAULT_SCHEMA,
+                {"book"},
+                user_defined_fkey_tables={},
+                views=["_view"],
+                node_columns={"book": ["isbn"]},
+            )
+            assert mock_logger.warning.call_count == 1
+            assert "Rebuilding it" in mock_logger.warning.call_args[0][0]
+
+        columns = [
+            row[0]
+            for row in connection.execute(
+                sa.text(
+                    "SELECT attname FROM pg_attribute "
+                    "WHERE attrelid = to_regclass('public._view') "
+                    "AND attnum > 0"
+                )
+            ).fetchall()
+        ]
+        assert set(columns) == set(MATERIALIZED_VIEW_COLUMNS)
+
+    def test_create_view_keeps_compatible_view(self, connection, book_cls):
+        """A current `_view` is reused and its rows preserved."""
+        pg_base = Base(connection.engine.url.database)
+
+        def fetchall(statement):
+            # short lived connection: a long lived one would hold a lock on
+            # `_view` and block the DROP below
+            return pg_base.fetchall(statement)
+
+        kwargs = dict(
+            user_defined_fkey_tables={},
+            node_columns={"book": ["isbn"]},
+        )
+        pg_base.execute(
+            sa.text(f"DROP MATERIALIZED VIEW IF EXISTS {DEFAULT_SCHEMA}._view")
+        )
+        create_view(
+            pg_base.engine,
+            pg_base.models,
+            fetchall,
+            "testdb",
+            DEFAULT_SCHEMA,
+            {"book"},
+            views=[],
+            **kwargs,
+        )
+        # second run sees the compatible view and must not warn
+        with patch("pgsync.view.logger") as mock_logger:
+            create_view(
+                pg_base.engine,
+                pg_base.models,
+                fetchall,
+                "testdb",
+                DEFAULT_SCHEMA,
+                {"book"},
+                views=["_view"],
+                **kwargs,
+            )
+            assert mock_logger.warning.call_count == 0
+
+        rows = fetchall(sa.text(f"SELECT * FROM {DEFAULT_SCHEMA}._view"))
+        assert len(rows) == 1
 
     def test_create_view_ddl_compile(self, connection):
         """Test CreateView DDL compiles correctly."""

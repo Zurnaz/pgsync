@@ -113,15 +113,18 @@ def main(
         **kwargs,
     )
 
-    validate: bool = False if teardown else True
-
     for doc in config_loader(
         config=config, schema_url=schema_url, s3_schema_url=s3_schema_url
     ):
+        # Validation must not run before setup: bootstrap is the command that
+        # creates the replication slot and (re)creates the internal materialized
+        # view, so a stale `_view` left by an older pgsync would otherwise make
+        # the fix impossible ("Required materialized view columns not present on
+        # _view. Please re-run bootstrap.").
         sync: Sync = Sync(
             doc,
             verbose=verbose,
-            validate=validate,
+            validate=False,
             repl_slots=False,
             **kwargs,
         )
@@ -129,6 +132,8 @@ def main(
             sync.teardown()
             continue
         sync.setup(no_create=no_create)
+        sync.validate(repl_slots=False)
+        sync.create_setting()
         logger.info(f"Bootstrap: {sync.database}")
 
 

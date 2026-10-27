@@ -11,7 +11,11 @@ from sqlalchemy.ext import compiler
 from sqlalchemy.schema import DDLElement
 from sqlalchemy.sql.selectable import Select
 
-from .constants import DEFAULT_SCHEMA, MATERIALIZED_VIEW
+from .constants import (
+    DEFAULT_SCHEMA,
+    MATERIALIZED_VIEW,
+    MATERIALIZED_VIEW_COLUMNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -384,34 +388,52 @@ def create_view(
 
     rows: dict = {}
     if MATERIALIZED_VIEW in views:
-        for (
-            table_name,
-            primary_keys,
-            foreign_keys,
-            indices,
-            columns,
-        ) in fetchall(
-            sa.select("*").select_from(
-                sa.text(f"{schema}.{MATERIALIZED_VIEW}")
+        # An existing view may predate the current column set (e.g. it was
+        # created by an older pgsync that had no `columns`). Such rows cannot be
+        # read positionally, so rebuild the view from the current schema instead
+        # of failing while unpacking. Rebuilding is safe: the rows only carry
+        # metadata for the tables in this run.
+        existing_columns: t.List[str] = [
+            column["name"]
+            for column in sa.inspect(engine).get_columns(
+                MATERIALIZED_VIEW, schema=schema
             )
-        ):
-            rows.setdefault(
+        ]
+        if set(existing_columns) == set(MATERIALIZED_VIEW_COLUMNS):
+            for (
                 table_name,
-                {
-                    "primary_keys": set(),
-                    "foreign_keys": set(),
-                    "indices": set(),
-                    "columns": set(),
-                },
+                primary_keys,
+                foreign_keys,
+                indices,
+                columns,
+            ) in fetchall(
+                sa.select("*").select_from(
+                    sa.text(f"{schema}.{MATERIALIZED_VIEW}")
+                )
+            ):
+                rows.setdefault(
+                    table_name,
+                    {
+                        "primary_keys": set(),
+                        "foreign_keys": set(),
+                        "indices": set(),
+                        "columns": set(),
+                    },
+                )
+                if primary_keys:
+                    rows[table_name]["primary_keys"] = set(primary_keys)
+                if foreign_keys:
+                    rows[table_name]["foreign_keys"] = set(foreign_keys)
+                if indices:
+                    rows[table_name]["indices"] = set(indices)
+                if columns:
+                    rows[table_name]["columns"] = set(columns)
+        else:
+            logger.warning(
+                f"Column mismatch on {schema}.{MATERIALIZED_VIEW}: found "
+                f"{existing_columns}, expected "
+                f"{list(MATERIALIZED_VIEW_COLUMNS)}. Rebuilding it."
             )
-            if primary_keys:
-                rows[table_name]["primary_keys"] = set(primary_keys)
-            if foreign_keys:
-                rows[table_name]["foreign_keys"] = set(foreign_keys)
-            if indices:
-                rows[table_name]["indices"] = set(indices)
-            if columns:
-                rows[table_name]["columns"] = set(columns)
         with engine.connect().execution_options(
             isolation_level="AUTOCOMMIT"
         ) as conn:
